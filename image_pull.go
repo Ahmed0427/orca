@@ -153,15 +153,19 @@ func (c *Client) newRequest(method, endpoint string) (*http.Request, error) {
 	return req, nil
 }
 
+type ManifestResult struct {
+	Manifest *ManifestResponse
+	RawBytes []byte
+	Digest   string
+}
+
 // GetManifest retrieves the manifest for a tag or digest. Auto-resolves multi-arch.
-func (c *Client) GetManifest(reference string) (*ManifestResponse, error) {
-	fmt.Printf("REFERENCE: %s\n", reference)
+func (c *Client) GetManifest(reference string) (*ManifestResult, error) {
 	req, err := c.newRequest("GET", "/manifests/"+reference)
 	if err != nil {
 		return nil, err
 	}
 
-	// accept both standard docker v2 and oci manifests
 	req.Header.Set("Accept", strings.Join([]string{
 		"application/vnd.docker.distribution.manifest.v2+json",
 		"application/vnd.docker.distribution.manifest.list.v2+json",
@@ -184,12 +188,17 @@ func (c *Client) GetManifest(reference string) (*ManifestResponse, error) {
 		}
 	}
 
-	var manifest ManifestResponse
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
 
-	// handle manifest lists (multi-arch)
+	var manifest ManifestResponse
+	if err := json.Unmarshal(bodyBytes, &manifest); err != nil {
+		return nil, err
+	}
+
+	// handle manifest lists (multi-arch indexes)
 	if len(manifest.Manifests) > 0 {
 		for _, m := range manifest.Manifests {
 			if m.Platform.Architecture == runtime.GOARCH && m.Platform.OS == runtime.GOOS {
@@ -200,7 +209,20 @@ func (c *Client) GetManifest(reference string) (*ManifestResponse, error) {
 		return nil, fmt.Errorf("could not find image version for OS:%s ARCH:%s",
 			runtime.GOOS, runtime.GOARCH)
 	}
-	return &manifest, nil
+
+	hash := sha256.New()
+	hash.Write(bodyBytes)
+	digestHex := fmt.Sprintf("sha256:%s", hex.EncodeToString(hash.Sum(nil)))
+
+	if strings.HasPrefix(reference, "sha256:") && digestHex != reference {
+		return nil, fmt.Errorf("manifest digest doesn't match")
+	}
+
+	return &ManifestResult{
+		Manifest: &manifest,
+		RawBytes: bodyBytes,
+		Digest:   digestHex,
+	}, nil
 }
 
 // GetConfig fetches the JSON image configuration.
@@ -234,12 +256,12 @@ func (c *Client) GetConfig(digest string, size int64) (*ConfigBlob, error) {
 	db := hash.Sum(nil)
 	d := hex.EncodeToString(db)
 	if fmt.Sprintf("sha256:%s", d) != digest {
-		return nil, fmt.Errorf("digests don't match")
+		return nil, fmt.Errorf("config digest don't match")
 	}
 
 	var conf ConfigBlob
 	if err := json.Unmarshal(buf, &conf); err != nil {
-		return nil, fmt.Errorf("json.Unmarshal: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal json: %w", err)
 	}
 
 	return &conf, nil
