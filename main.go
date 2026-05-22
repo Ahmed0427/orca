@@ -126,9 +126,19 @@ func ExtractLayerTGZ(gzipStream io.Reader, targetDir string) error {
 			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
 				return fmt.Errorf("failed to create parent directory: %w", err)
 			}
-			_ = os.Remove(target)
 			if err := os.Symlink(header.Linkname, target); err != nil {
 				return fmt.Errorf("failed to create symlink: %w", err)
+			}
+		case tar.TypeLink:
+			old := filepath.Join(targetDir, header.Linkname)
+			nw := filepath.Join(targetDir, cleanPath)
+
+			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory: %w", err)
+			}
+
+			if err := os.Link(old, nw); err != nil {
+				return fmt.Errorf("failed to create link from %s to %s: %w", old, nw, err)
 			}
 		}
 	}
