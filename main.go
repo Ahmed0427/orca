@@ -1,12 +1,17 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -37,6 +42,97 @@ func blobExists(digest string) bool {
 		return false
 	}
 	return info.Mode().IsRegular()
+}
+
+func ExtractLayerTGZ(gzipStream io.Reader, targetDir string) error {
+	uncompressedStream, err := gzip.NewReader(gzipStream)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer uncompressedStream.Close()
+
+	tarReader := tar.NewReader(uncompressedStream)
+
+	opaqueAttr := "trusted.overlay.opaque"
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read tar header: %w", err)
+		}
+
+		cleanPath := filepath.Clean(header.Name)
+		baseName := filepath.Base(cleanPath)
+		dirName := filepath.Dir(cleanPath)
+		targetDirPath := filepath.Join(targetDir, dirName)
+
+		if baseName == ".wh..wh..opq" {
+			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
+				return fmt.Errorf("failed to create parent for opaque directory: %w", err)
+			}
+
+			err := unix.Setxattr(targetDirPath, opaqueAttr, []byte{'y'}, 0)
+			if err != nil {
+				return fmt.Errorf("failed to set opaque xattr on %s: %w", targetDirPath, err)
+			}
+			continue
+		}
+
+		if strings.HasPrefix(baseName, ".wh.") {
+			realFileName := strings.TrimPrefix(baseName, ".wh.")
+			targetPath := filepath.Join(targetDirPath, realFileName)
+
+			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory for whiteout: %w", err)
+			}
+
+			err := unix.Mknod(targetPath, unix.S_IFCHR|0600, 0)
+			if err != nil {
+				return fmt.Errorf("failed to create whiteout device at %s: %w", targetPath, err)
+			}
+			continue
+		}
+
+		target := filepath.Join(targetDir, cleanPath)
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, header.FileInfo().Mode()); err != nil {
+				return fmt.Errorf("failed to create directory: %w", err)
+			}
+
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory: %w", err)
+			}
+
+			flag := os.O_CREATE | os.O_RDWR | os.O_TRUNC
+			f, err := os.OpenFile(target, flag, header.FileInfo().Mode())
+
+			if err != nil {
+				return fmt.Errorf("failed to create file: %w", err)
+			}
+
+			if _, err := io.Copy(f, tarReader); err != nil {
+				f.Close()
+				return fmt.Errorf("failed to copy file contents: %w", err)
+			}
+			f.Close()
+
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory: %w", err)
+			}
+			_ = os.Remove(target)
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				return fmt.Errorf("failed to create symlink: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 func pull(target string) error {
