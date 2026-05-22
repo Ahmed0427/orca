@@ -67,11 +67,11 @@ func (mp *MultiProgress) Render() {
 		empty := barWidth - filled
 
 		barStr := strings.Repeat("=", filled) + strings.Repeat(" ", empty)
-		mbTransferred := float64(task.Transferred) / 1024 / 1024
-		mbTotal := float64(task.Total) / 1024 / 1024
+		formatedTransferred := FormatBytes(task.Transferred)
+		formatedTotal := FormatBytes(task.Total)
 
-		sb.WriteString(fmt.Sprintf("\033[K%s [%s] %3.0f%% (%6.2f/%6.2f MB)\n",
-			task.Title, barStr, pct, mbTransferred, mbTotal))
+		sb.WriteString(fmt.Sprintf("\033[K%s [%s] %3.0f%% (%s/%s)\n",
+			task.Title, barStr, pct, formatedTransferred, formatedTotal))
 		currentLines++
 	}
 
@@ -101,4 +101,17 @@ func (pp ProgressProxy) Write(p []byte) (int, error) {
 		pp.Layout.Render()
 	}
 	return n, err
+}
+
+func FormatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
