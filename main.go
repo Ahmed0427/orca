@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -170,21 +171,19 @@ func pull(target string) error {
 	}
 
 	confDigest := manifestResult.Manifest.Config.Digest
-	if !blobExists(confDigest) {
-		conf, err := client.GetConfig(confDigest, manifestResult.Manifest.Config.Size)
-		if err != nil {
-			return fmt.Errorf("failed to get config: %w", err)
-		}
+	conf, err := client.GetConfig(confDigest, manifestResult.Manifest.Config.Size)
+	if err != nil {
+		return fmt.Errorf("failed to get config: %w", err)
+	}
 
-		confBytes, err := json.Marshal(conf)
-		if err != nil {
-			return fmt.Errorf("failed to marshal config: %w", err)
-		}
+	confBytes, err := json.Marshal(conf)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
 
-		confPath := filepath.Join(basePath, "blobs", confDigest)
-		if err := os.WriteFile(confPath, confBytes, 0644); err != nil {
-			return fmt.Errorf("failed to write config blob: %w", err)
-		}
+	confPath := filepath.Join(basePath, "blobs", confDigest)
+	if err := os.WriteFile(confPath, confBytes, 0644); err != nil {
+		return fmt.Errorf("failed to write config blob: %w", err)
 	}
 
 	pre := []string{fmt.Sprintf("Pulling from %s/%s with tag=%s", namespace, repo, tag)}
@@ -230,27 +229,46 @@ func pull(target string) error {
 		}
 	}
 
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(manifestResult.Manifest.Layers))
+
+	fmt.Print("Extracting layers... ")
+
 	for i, l := range manifestResult.Manifest.Layers {
-		diffID := conf.Rootfs.DiffIds[i]
-		layerID := strings.TrimPrefix(diffID, "sha256:")[:12]
+		wg.Add(1)
+		go func(index int, layerDigest string) {
+			defer wg.Done()
 
-		if !layerExists(layerID) {
-			f, err := os.Open(filepath.Join(basePath, "blobs", l.Digest))
+			diffID := conf.Rootfs.DiffIds[index]
+			layerID := strings.TrimPrefix(diffID, "sha256:")[:12]
+
+			if layerExists(layerID) {
+				return
+			}
+
+			f, err := os.Open(filepath.Join(basePath, "blobs", layerDigest))
 			if err != nil {
-				return fmt.Errorf("failed to open blob for extraction: %w", err)
+				errChan <- err
+				return
 			}
+			defer f.Close()
 
-			targetDir := filepath.Join(basePath, "layers", layerID)
-			if err := ExtractLayerTGZ(f, targetDir); err != nil {
-				f.Close()
-				return fmt.Errorf("failed to extract layer %s: %w", layerID, err)
+			if err := ExtractLayerTGZ(f, filepath.Join(basePath, "layers", layerID)); err != nil {
+				errChan <- err
 			}
-			f.Close()
+		}(i, l.Digest)
+	}
 
-			fmt.Printf("Extracted layer %s\n", layerID)
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		if err != nil {
+			return fmt.Errorf("extraction error: %w", err)
 		}
 	}
 
+	fmt.Println("Done.")
 	return nil
 }
 
