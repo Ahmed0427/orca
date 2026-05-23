@@ -35,17 +35,23 @@ func ensureDirs() error {
 	return nil
 }
 
-func blobExists(digest string) bool {
-	blobPath := filepath.Join(basePath, "blobs", digest)
-	info, err := os.Stat(blobPath)
-	if err != nil {
-		return false
-	}
-	return info.Mode().IsRegular()
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
-func ExtractLayerTGZ(gzipStream io.Reader, targetDir string) error {
-	uncompressedStream, err := gzip.NewReader(gzipStream)
+func blobExists(digest string) bool {
+	path := filepath.Join(basePath, "blobs", digest)
+	return pathExists(path)
+}
+
+func layerExists(id string) bool {
+	path := filepath.Join(basePath, "layers", id)
+	return pathExists(path)
+}
+
+func ExtractLayerTGZ(compressedStream io.Reader, targetDir string) error {
+	uncompressedStream, err := gzip.NewReader(compressedStream)
 	if err != nil {
 		return fmt.Errorf("failed to create gzip reader: %w", err)
 	}
@@ -191,7 +197,8 @@ func pull(target string) error {
 
 	for _, l := range manifestResult.Manifest.Layers {
 		if !blobExists(l.Digest) {
-			mp.AddTask(strings.TrimPrefix(l.Digest, "sha256:")[:12], l.Digest, l.Size)
+			title := strings.TrimPrefix(l.Digest, "sha256:")[:12]
+			mp.AddTask(title, l.Digest, l.Size)
 		}
 	}
 
@@ -220,6 +227,27 @@ func pull(target string) error {
 
 		if err != nil {
 			return err
+		}
+	}
+
+	for i, l := range manifestResult.Manifest.Layers {
+		diffID := conf.Rootfs.DiffIds[i]
+		layerID := strings.TrimPrefix(diffID, "sha256:")[:12]
+
+		if !layerExists(layerID) {
+			f, err := os.Open(filepath.Join(basePath, "blobs", l.Digest))
+			if err != nil {
+				return fmt.Errorf("failed to open blob for extraction: %w", err)
+			}
+
+			targetDir := filepath.Join(basePath, "layers", layerID)
+			if err := ExtractLayerTGZ(f, targetDir); err != nil {
+				f.Close()
+				return fmt.Errorf("failed to extract layer %s: %w", layerID, err)
+			}
+			f.Close()
+
+			fmt.Printf("Extracted layer %s\n", layerID)
 		}
 	}
 
