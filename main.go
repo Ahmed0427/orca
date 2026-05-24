@@ -3,6 +3,8 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,9 +17,33 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const (
-	basePath = "/var/orca"
-)
+const basePath = "/var/orca"
+
+func blobPath(digest string) string {
+	return filepath.Join(basePath, "blobs", digest)
+}
+func layerPath(id string) string {
+	return filepath.Join(basePath, "layers", id)
+}
+func tagPath(tag string) string {
+	return filepath.Join(basePath, "tags", tag)
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func blobExists(digest string) bool {
+	return pathExists(blobPath(digest))
+}
+func layerExists(id string) bool {
+	return pathExists(layerPath(id))
+}
+
+func layerID(diffID string) string {
+	return strings.TrimPrefix(diffID, "sha256:")[:12]
+}
 
 func ensureDirs() error {
 	dirs := []string{
@@ -27,7 +53,6 @@ func ensureDirs() error {
 		filepath.Join(basePath, "tags"),
 		filepath.Join(basePath, "containers"),
 	}
-
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", d, err)
@@ -36,22 +61,151 @@ func ensureDirs() error {
 	return nil
 }
 
-func pathExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func deleteBlob(digest string) error {
+	err := os.Remove(blobPath(digest))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
-func blobExists(digest string) bool {
-	path := filepath.Join(basePath, "blobs", digest)
-	return pathExists(path)
+func deleteLayer(id string) error {
+	return os.RemoveAll(layerPath(id))
 }
 
-func layerExists(id string) bool {
-	path := filepath.Join(basePath, "layers", id)
-	return pathExists(path)
+func verifyImage(tag string) (bool, error) {
+	manifestPath := tagPath(tag)
+	if !pathExists(manifestPath) {
+		return false, fmt.Errorf("image %s not found", tag)
+	}
+
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return false, err
+	}
+	var manifest ManifestResponse
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return false, err
+	}
+
+	configFile, err := os.Open(blobPath(manifest.Config.Digest))
+	if err != nil {
+		return false, fmt.Errorf("image corrupted: config blob missing: %w", err)
+	}
+	defer configFile.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, configFile); err != nil {
+		return false, fmt.Errorf("failed to hash config file: %w", err)
+	}
+	calculatedDigest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	if calculatedDigest != manifest.Config.Digest {
+		return false, fmt.Errorf("image corrupted: config hash mismatch")
+	}
+
+	if _, err := configFile.Seek(0, 0); err != nil {
+		return false, err
+	}
+	configBytes, err := io.ReadAll(configFile)
+	if err != nil {
+		return false, err
+	}
+	var config ConfigBlob
+	if err := json.Unmarshal(configBytes, &config); err != nil {
+		return false, err
+	}
+
+	for _, diffID := range config.Rootfs.DiffIds {
+		id := layerID(diffID)
+		if !pathExists(layerPath(id)) {
+			return false, fmt.Errorf("image corrupted: missing layer directory with ID: %s", id)
+		}
+	}
+	return true, nil
 }
 
-func ExtractLayerTGZ(compressedStream io.Reader, targetDir string) error {
+func removeImage(tag string) error {
+	p := tagPath(tag)
+	if !pathExists(p) {
+		return fmt.Errorf("image tag %s does not exist", tag)
+	}
+	if err := os.Remove(p); err != nil {
+		return fmt.Errorf("failed to remove tag %s: %w", tag, err)
+	}
+	return garbageCollect()
+}
+
+func garbageCollect() error {
+	activeBlobs := make(map[string]bool)
+	activeLayers := make(map[string]bool)
+
+	tagsDir := filepath.Join(basePath, "tags")
+	if !pathExists(tagsDir) {
+		return nil
+	}
+
+	tags, err := os.ReadDir(tagsDir)
+	if err != nil {
+		return fmt.Errorf("failed to read tags directory: %w", err)
+	}
+
+	for _, tagFile := range tags {
+		if tagFile.IsDir() {
+			continue
+		}
+		manifestBytes, err := os.ReadFile(filepath.Join(tagsDir, tagFile.Name()))
+		if err != nil {
+			continue
+		}
+		var manifest ManifestResponse
+		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+			continue
+		}
+		activeBlobs[manifest.Config.Digest] = true
+
+		configBytes, err := os.ReadFile(blobPath(manifest.Config.Digest))
+		if err != nil {
+			continue
+		}
+		var config ConfigBlob
+		if err := json.Unmarshal(configBytes, &config); err != nil {
+			continue
+		}
+		for _, diffID := range config.Rootfs.DiffIds {
+			activeLayers[layerID(diffID)] = true
+		}
+	}
+
+	blobsDir := filepath.Join(basePath, "blobs")
+	if pathExists(blobsDir) {
+		blobs, err := os.ReadDir(blobsDir)
+		if err != nil {
+			return err
+		}
+		for _, b := range blobs {
+			if !activeBlobs[b.Name()] {
+				_ = os.Remove(filepath.Join(blobsDir, b.Name()))
+			}
+		}
+	}
+
+	layersDir := filepath.Join(basePath, "layers")
+	if pathExists(layersDir) {
+		layers, err := os.ReadDir(layersDir)
+		if err != nil {
+			return err
+		}
+		for _, l := range layers {
+			if !activeLayers[l.Name()] {
+				_ = os.RemoveAll(filepath.Join(layersDir, l.Name()))
+			}
+		}
+	}
+
+	return nil
+}
+
+func extractLayerTGZ(compressedStream io.Reader, targetDir string) error {
 	uncompressedStream, err := gzip.NewReader(compressedStream)
 	if err != nil {
 		return fmt.Errorf("failed to create gzip reader: %w", err)
@@ -59,8 +213,7 @@ func ExtractLayerTGZ(compressedStream io.Reader, targetDir string) error {
 	defer uncompressedStream.Close()
 
 	tarReader := tar.NewReader(uncompressedStream)
-
-	opaqueAttr := "trusted.overlay.opaque"
+	const opaqueAttr = "trusted.overlay.opaque"
 
 	for {
 		header, err := tarReader.Next()
@@ -80,9 +233,7 @@ func ExtractLayerTGZ(compressedStream io.Reader, targetDir string) error {
 			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
 				return fmt.Errorf("failed to create parent for opaque directory: %w", err)
 			}
-
-			err := unix.Setxattr(targetDirPath, opaqueAttr, []byte{'y'}, 0)
-			if err != nil {
+			if err := unix.Setxattr(targetDirPath, opaqueAttr, []byte{'y'}, 0); err != nil {
 				return fmt.Errorf("failed to set opaque xattr on %s: %w", targetDirPath, err)
 			}
 			continue
@@ -91,13 +242,10 @@ func ExtractLayerTGZ(compressedStream io.Reader, targetDir string) error {
 		if strings.HasPrefix(baseName, ".wh.") {
 			realFileName := strings.TrimPrefix(baseName, ".wh.")
 			targetPath := filepath.Join(targetDirPath, realFileName)
-
 			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
 				return fmt.Errorf("failed to create parent directory for whiteout: %w", err)
 			}
-
-			err := unix.Mknod(targetPath, unix.S_IFCHR|0600, 0)
-			if err != nil {
+			if err := unix.Mknod(targetPath, unix.S_IFCHR|0600, 0); err != nil {
 				return fmt.Errorf("failed to create whiteout device at %s: %w", targetPath, err)
 			}
 			continue
@@ -115,14 +263,10 @@ func ExtractLayerTGZ(compressedStream io.Reader, targetDir string) error {
 			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
 				return fmt.Errorf("failed to create parent directory: %w", err)
 			}
-
-			flag := os.O_CREATE | os.O_RDWR | os.O_TRUNC
-			f, err := os.OpenFile(target, flag, header.FileInfo().Mode())
-
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR|os.O_TRUNC, header.FileInfo().Mode())
 			if err != nil {
 				return fmt.Errorf("failed to create file: %w", err)
 			}
-
 			if _, err := io.Copy(f, tarReader); err != nil {
 				f.Close()
 				return fmt.Errorf("failed to copy file contents: %w", err)
@@ -136,23 +280,21 @@ func ExtractLayerTGZ(compressedStream io.Reader, targetDir string) error {
 			if err := os.Symlink(header.Linkname, target); err != nil {
 				return fmt.Errorf("failed to create symlink: %w", err)
 			}
+
 		case tar.TypeLink:
 			old := filepath.Join(targetDir, header.Linkname)
-			nw := filepath.Join(targetDir, cleanPath)
-
 			if err := os.MkdirAll(targetDirPath, 0755); err != nil {
 				return fmt.Errorf("failed to create parent directory: %w", err)
 			}
-
-			if err := os.Link(old, nw); err != nil {
-				return fmt.Errorf("failed to create link from %s to %s: %w", old, nw, err)
+			if err := os.Link(old, target); err != nil {
+				return fmt.Errorf("failed to create link from %s to %s: %w", old, target, err)
 			}
 		}
 	}
 	return nil
 }
 
-func pull(target string) error {
+func pullImage(target string) error {
 	namespace, repo, tag := parseImageTarget(target)
 
 	client, err := NewClient(namespace, repo)
@@ -165,7 +307,7 @@ func pull(target string) error {
 		return fmt.Errorf("failed to get manifest: %w", err)
 	}
 
-	manifestPath := filepath.Join(basePath, "tags", fmt.Sprintf("%s:%s", repo, tag))
+	manifestPath := tagPath(fmt.Sprintf("%s:%s", repo, tag))
 	if err := os.WriteFile(manifestPath, manifestResult.RawBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write manifest: %w", err)
 	}
@@ -180,9 +322,7 @@ func pull(target string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-
-	confPath := filepath.Join(basePath, "blobs", confDigest)
-	if err := os.WriteFile(confPath, confBytes, 0644); err != nil {
+	if err := os.WriteFile(blobPath(confDigest), confBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write config blob: %w", err)
 	}
 
@@ -191,7 +331,6 @@ func pull(target string) error {
 		fmt.Sprintf("Digest: %s", manifestResult.Digest),
 		fmt.Sprintf("Status: Downloaded newer image for %s:%s", repo, tag),
 	}
-
 	mp := NewMultiProgress(pre, post)
 
 	for _, l := range manifestResult.Manifest.Layers {
@@ -200,30 +339,22 @@ func pull(target string) error {
 			mp.AddTask(title, l.Digest, l.Size)
 		}
 	}
-
 	mp.Render()
 
 	for _, task := range mp.Tasks {
 		err := func() error {
-			layerPath := filepath.Join(basePath, "blobs", task.ID)
-			dst, err := os.Create(layerPath)
+			dst, err := os.Create(blobPath(task.ID))
 			if err != nil {
-				return fmt.Errorf("failed to create layer file %s: %w", layerPath, err)
+				return fmt.Errorf("failed to create layer file: %w", err)
 			}
 			defer dst.Close()
 
-			proxy := ProgressProxy{
-				Task:   task,
-				Layout: mp,
-				Writer: dst,
-			}
-
+			proxy := ProgressProxy{Task: task, Layout: mp, Writer: dst}
 			if err := client.DownloadLayer(task.ID, task.Total, proxy); err != nil {
 				return fmt.Errorf("failed to download layer %s: %w", task.ID, err)
 			}
 			return nil
 		}()
-
 		if err != nil {
 			return err
 		}
@@ -239,21 +370,23 @@ func pull(target string) error {
 		go func(index int, layerDigest string) {
 			defer wg.Done()
 
-			diffID := conf.Rootfs.DiffIds[index]
-			layerID := strings.TrimPrefix(diffID, "sha256:")[:12]
-
-			if layerExists(layerID) {
+			id := layerID(conf.Rootfs.DiffIds[index])
+			if layerExists(id) {
 				return
 			}
 
-			f, err := os.Open(filepath.Join(basePath, "blobs", layerDigest))
+			f, err := os.Open(blobPath(layerDigest))
 			if err != nil {
 				errChan <- err
 				return
 			}
 			defer f.Close()
 
-			if err := ExtractLayerTGZ(f, filepath.Join(basePath, "layers", layerID)); err != nil {
+			if err := extractLayerTGZ(f, layerPath(id)); err != nil {
+				errChan <- err
+				return
+			}
+			if err := deleteBlob(layerDigest); err != nil {
 				errChan <- err
 			}
 		}(i, l.Digest)
@@ -268,22 +401,39 @@ func pull(target string) error {
 		}
 	}
 
-	fmt.Println("Done.")
+	fmt.Println("Done")
 	return nil
 }
 
 func main() {
+	if err := ensureDirs(); err != nil {
+		log.Fatalf("initialization failed: %v", err)
+	}
+
 	if len(os.Args) < 2 {
-		fmt.Printf("Usage: %s <repository:tag>\n", os.Args[0])
-		fmt.Printf("Example: %s library/alpine:latest\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <command> [args...]\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	if err := ensureDirs(); err != nil {
-		log.Fatalf("Initialization failed: %v", err)
-	}
-
-	if err := pull(os.Args[1]); err != nil {
-		log.Fatalf("Pull failed: %v", err)
+	switch os.Args[1] {
+	case "pull":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: %s pull <image>\n", os.Args[0])
+			os.Exit(1)
+		}
+		if err := pullImage(os.Args[2]); err != nil {
+			log.Fatalf("pull failed: %v", err)
+		}
+	case "rm":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: %s rm <image:tag>\n", os.Args[0])
+			os.Exit(1)
+		}
+		if err := removeImage(os.Args[2]); err != nil {
+			log.Fatalf("remove failed: %v", err)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "no such command: %s\n", os.Args[1])
+		os.Exit(1)
 	}
 }
