@@ -284,7 +284,9 @@ func (c *Client) DownloadLayer(digest string, expectedSize int64, dest io.Writer
 		return fmt.Errorf("failed to fetch layer blob, status: %d", resp.StatusCode)
 	}
 
-	written, err := io.Copy(dest, resp.Body)
+	hash := sha256.New()
+
+	written, err := io.Copy(io.MultiWriter(dest, hash), resp.Body)
 	if err != nil {
 		return err
 	}
@@ -292,6 +294,13 @@ func (c *Client) DownloadLayer(digest string, expectedSize int64, dest io.Writer
 	if expectedSize > 0 && written != expectedSize {
 		return fmt.Errorf("size mismatch for %s: expected %d, got %d",
 			digest, expectedSize, written)
+	}
+
+	sha256Bytes := hash.Sum(nil)
+	calculatedDigest := hex.EncodeToString(sha256Bytes)
+
+	if strings.TrimPrefix(digest, "sha256:") != calculatedDigest {
+		return fmt.Errorf("layer digest doesn't match")
 	}
 
 	return nil
