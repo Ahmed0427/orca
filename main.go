@@ -73,55 +73,61 @@ func deleteLayer(id string) error {
 	return os.RemoveAll(layerPath(id))
 }
 
-func verifyImage(tag string) (bool, error) {
+func verifyImage(tag string) error {
 	manifestPath := tagPath(tag)
 	if !pathExists(manifestPath) {
-		return false, fmt.Errorf("image %s not found", tag)
+		return fmt.Errorf("image %s not found", tag)
 	}
 
 	manifestBytes, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return false, err
+		return fmt.Errorf("failed to read manifest: %w", err)
 	}
 	var manifest ManifestResponse
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-		return false, err
+		return fmt.Errorf("image corrupted: invalid manifest JSON: %w", err)
 	}
 
 	configFile, err := os.Open(blobPath(manifest.Config.Digest))
 	if err != nil {
-		return false, fmt.Errorf("image corrupted: config blob missing: %w", err)
+		if os.IsNotExist(err) {
+			return fmt.Errorf("image corrupted: config blob missing: %w", err)
+		}
+		return fmt.Errorf("failed to open config blob: %w", err)
 	}
 	defer configFile.Close()
 
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, configFile); err != nil {
-		return false, fmt.Errorf("failed to hash config file: %w", err)
+	hash := sha256.New()
+	if _, err := io.Copy(hash, configFile); err != nil {
+		return fmt.Errorf("failed to hash config file: %w", err)
 	}
-	calculatedDigest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	calculatedDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	fmt.Println(calculatedDigest)
+	fmt.Println(manifest.Config.Digest)
 	if calculatedDigest != manifest.Config.Digest {
-		return false, fmt.Errorf("image corrupted: config hash mismatch")
+		return fmt.Errorf("image corrupted: config hash mismatch")
 	}
 
 	if _, err := configFile.Seek(0, 0); err != nil {
-		return false, err
+		return fmt.Errorf("failed to seek config file: %w", err)
 	}
 	configBytes, err := io.ReadAll(configFile)
 	if err != nil {
-		return false, err
+		return fmt.Errorf("failed to read config file: %w", err)
 	}
 	var config ConfigBlob
 	if err := json.Unmarshal(configBytes, &config); err != nil {
-		return false, err
+		return fmt.Errorf("image corrupted: invalid config JSON: %w", err)
 	}
 
 	for _, diffID := range config.Rootfs.DiffIds {
 		id := layerID(diffID)
 		if !pathExists(layerPath(id)) {
-			return false, fmt.Errorf("image corrupted: missing layer directory with ID: %s", id)
+			return fmt.Errorf("image corrupted: missing layer directory with ID: %s", id)
 		}
 	}
-	return true, nil
+
+	return nil
 }
 
 func removeImage(tag string) error {
@@ -132,7 +138,9 @@ func removeImage(tag string) error {
 	if err := os.Remove(p); err != nil {
 		return fmt.Errorf("failed to remove tag %s: %w", tag, err)
 	}
-	return garbageCollect()
+	err := garbageCollect()
+	fmt.Printf("%s image removed successfully\n", tag)
+	return err
 }
 
 func garbageCollect() error {
@@ -173,6 +181,9 @@ func garbageCollect() error {
 		}
 		for _, diffID := range config.Rootfs.DiffIds {
 			activeLayers[layerID(diffID)] = true
+		}
+		for _, l := range manifest.Layers {
+			deleteBlob(l.Digest)
 		}
 	}
 
@@ -313,15 +324,11 @@ func pullImage(target string) error {
 	}
 
 	confDigest := manifestResult.Manifest.Config.Digest
-	conf, err := client.GetConfig(confDigest, manifestResult.Manifest.Config.Size)
+	conf, confBytes, err := client.GetConfig(confDigest, manifestResult.Manifest.Config.Size)
 	if err != nil {
 		return fmt.Errorf("failed to get config: %w", err)
 	}
 
-	confBytes, err := json.Marshal(conf)
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
 	if err := os.WriteFile(blobPath(confDigest), confBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write config blob: %w", err)
 	}
@@ -432,6 +439,37 @@ func main() {
 		if err := removeImage(os.Args[2]); err != nil {
 			log.Fatalf("remove failed: %v", err)
 		}
+	case "verify":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: %s verify <image:tag>\n", os.Args[0])
+			os.Exit(1)
+		}
+
+		err := verifyImage(os.Args[2])
+		if err != nil {
+			if strings.HasPrefix(err.Error(), "image corrupted:") {
+				fmt.Printf("Critical: %v\n", err)
+				fmt.Printf("Run '%s rm %s' to remove it, then re-download.\n", os.Args[0], os.Args[2])
+				os.Exit(1)
+			} else {
+				log.Fatalf("Failed to complete verification: %v\n", err)
+			}
+		}
+		fmt.Println("Image is fine")
+	case "images":
+		tagsDir := filepath.Join(basePath, "tags")
+		if !pathExists(tagsDir) {
+			log.Fatalf("tags directory doesn't exist\n")
+		}
+		tags, err := os.ReadDir(tagsDir)
+		if err != nil {
+			log.Fatalf("failed to read tags directory: %v\n", err)
+		}
+		for _, tagFile := range tags {
+			fmt.Println(tagFile.Name())
+		}
+	case "gc":
+		garbageCollect()
 	default:
 		fmt.Fprintf(os.Stderr, "no such command: %s\n", os.Args[1])
 		os.Exit(1)
