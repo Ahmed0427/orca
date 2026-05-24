@@ -226,29 +226,29 @@ func (c *Client) GetManifest(reference string) (*ManifestResult, error) {
 }
 
 // GetConfig fetches the JSON image configuration.
-func (c *Client) GetConfig(digest string, size int64) (*ConfigBlob, error) {
+func (c *Client) GetConfig(digest string, size int64) (*ConfigBlob, []byte, error) {
 	req, err := c.newRequest("GET", "/blobs/"+digest)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch config blob, status: %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("failed to fetch config blob, status: %d", resp.StatusCode)
 	}
 
 	buf, err := io.ReadAll(io.LimitReader(resp.Body, size))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	if int64(len(buf)) != size {
-		return nil, fmt.Errorf("size mismatch: expected %d bytes, got %d", size, len(buf))
+		return nil, nil, fmt.Errorf("size mismatch: expected %d bytes, got %d", size, len(buf))
 	}
 
 	hash := sha256.New()
@@ -256,15 +256,15 @@ func (c *Client) GetConfig(digest string, size int64) (*ConfigBlob, error) {
 	db := hash.Sum(nil)
 	d := hex.EncodeToString(db)
 	if fmt.Sprintf("sha256:%s", d) != digest {
-		return nil, fmt.Errorf("config digest don't match")
+		return nil, nil, fmt.Errorf("config digest don't match")
 	}
 
 	var conf ConfigBlob
 	if err := json.Unmarshal(buf, &conf); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal json: %w", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal json: %w", err)
 	}
 
-	return &conf, nil
+	return &conf, buf, nil
 }
 
 // DownloadLayer streams a compressed layer blob to the provided io.Writer.
