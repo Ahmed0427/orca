@@ -102,8 +102,6 @@ func verifyImage(tag string) error {
 		return fmt.Errorf("failed to hash config file: %w", err)
 	}
 	calculatedDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	fmt.Println(calculatedDigest)
-	fmt.Println(manifest.Config.Digest)
 	if calculatedDigest != manifest.Config.Digest {
 		return fmt.Errorf("image corrupted: config hash mismatch")
 	}
@@ -159,6 +157,9 @@ func garbageCollect() error {
 
 	for _, tagFile := range tags {
 		if tagFile.IsDir() {
+			continue
+		}
+		if err := verifyImage(tagFile.Name()); err != nil {
 			continue
 		}
 		manifestBytes, err := os.ReadFile(filepath.Join(tagsDir, tagFile.Name()))
