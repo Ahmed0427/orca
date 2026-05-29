@@ -10,7 +10,7 @@ import (
 )
 
 func PullImage(target string) error {
-	namespace, repo, tag := parseImageTarget(target)
+	namespace, repo, tag := ParseImageTarget(target)
 
 	client, err := NewClient(namespace, repo)
 	if err != nil {
@@ -22,7 +22,7 @@ func PullImage(target string) error {
 		return fmt.Errorf("failed to get manifest: %w", err)
 	}
 
-	manifestPath := tagPath(fmt.Sprintf("%s:%s", repo, tag))
+	manifestPath := TagPath(fmt.Sprintf("%s:%s", repo, tag))
 	if err := os.WriteFile(manifestPath, manifestResult.RawBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write manifest: %w", err)
 	}
@@ -33,20 +33,19 @@ func PullImage(target string) error {
 		return fmt.Errorf("failed to get config: %w", err)
 	}
 
-	if err := os.WriteFile(blobPath(confDigest), confBytes, 0644); err != nil {
+	if err := os.WriteFile(BlobPath(confDigest), confBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write config blob: %w", err)
 	}
 
-	// Progress layout management (Assumes MultiProgress is in a progress pkg or here)
-	pre := []string{fmt.Sprintf("Pulling from %s/%s with tag=%s", namespace, repo, tag)}
 	post := []string{
 		fmt.Sprintf("Digest: %s", manifestResult.Digest),
 		fmt.Sprintf("Status: Downloaded newer image for %s:%s", repo, tag),
 	}
+	pre := []string{fmt.Sprintf("Pulling from %s/%s with tag=%s", namespace, repo, tag)}
 	mp := progress.NewMultiProgress(pre, post)
 
 	for _, l := range manifestResult.Manifest.Layers {
-		if !blobExists(l.Digest) {
+		if !BlobExists(l.Digest) {
 			title := strings.TrimPrefix(l.Digest, "sha256:")[:12]
 			mp.AddTask(title, l.Digest, l.Size)
 		}
@@ -55,7 +54,7 @@ func PullImage(target string) error {
 
 	for _, task := range mp.Tasks {
 		err := func() error {
-			dst, err := os.Create(blobPath(task.ID))
+			dst, err := os.Create(BlobPath(task.ID))
 			if err != nil {
 				return fmt.Errorf("failed to create layer file: %w", err)
 			}
@@ -82,23 +81,23 @@ func PullImage(target string) error {
 		go func(index int, layerDigest string) {
 			defer wg.Done()
 
-			id := layerID(conf.Rootfs.DiffIds[index])
-			if layerExists(id) {
+			id := LayerID(conf.Rootfs.DiffIds[index])
+			if LayerExists(id) {
 				return
 			}
 
-			f, err := os.Open(blobPath(layerDigest))
+			f, err := os.Open(BlobPath(layerDigest))
 			if err != nil {
 				errChan <- err
 				return
 			}
 			defer f.Close()
 
-			if err := ExtractLayerTGZ(f, layerPath(id)); err != nil {
+			if err := ExtractLayerTGZ(f, LayerPath(id)); err != nil {
 				errChan <- err
 				return
 			}
-			_ = os.Remove(blobPath(layerDigest)) // cleanup compressed blob right after extraction
+			_ = os.Remove(BlobPath(layerDigest)) // cleanup compressed blob right after extraction
 		}(i, l.Digest)
 	}
 

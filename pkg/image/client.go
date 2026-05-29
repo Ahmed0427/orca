@@ -74,7 +74,6 @@ type ConfigBlob struct {
 	} `json:"rootfs"`
 }
 
-// Client holds the connection state and configuration for pulling images.
 type Client struct {
 	httpClient *http.Client
 	registry   string
@@ -83,7 +82,6 @@ type Client struct {
 	repo       string
 }
 
-// NewClient initializes a new Docker registry client and authenticates.
 func NewClient(namespace, repo string) (*Client, error) {
 	c := &Client{
 		httpClient: &http.Client{},
@@ -92,13 +90,13 @@ func NewClient(namespace, repo string) (*Client, error) {
 		repo:       repo,
 	}
 
-	if err := c.authenticate(); err != nil {
+	if err := c.Authenticate(); err != nil {
 		return nil, fmt.Errorf("failed to authenticate: %w", err)
 	}
 	return c, nil
 }
 
-func parseImageTarget(targetImage string) (string, string, string) {
+func ParseImageTarget(targetImage string) (string, string, string) {
 	var namespace, repo, tag string
 
 	colonIndex := strings.LastIndex(targetImage, ":")
@@ -121,7 +119,7 @@ func parseImageTarget(targetImage string) (string, string, string) {
 	return namespace, repo, tag
 }
 
-func (c *Client) authenticate() error {
+func (c *Client) Authenticate() error {
 	url := fmt.Sprintf("%s?service=registry.docker.io&scope=repository:%s:pull",
 		defaultAuthService, fmt.Sprintf("%s/%s", c.namespace, c.repo))
 
@@ -144,7 +142,7 @@ func (c *Client) authenticate() error {
 	return nil
 }
 
-func (c *Client) newRequest(method, endpoint string) (*http.Request, error) {
+func (c *Client) NewRequest(method, endpoint string) (*http.Request, error) {
 	req, err := http.NewRequest(method, c.registry+c.namespace+"/"+c.repo+endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -161,7 +159,7 @@ type ManifestResult struct {
 
 // GetManifest retrieves the manifest for a tag or digest. Auto-resolves multi-arch.
 func (c *Client) GetManifest(reference string) (*ManifestResult, error) {
-	req, err := c.newRequest("GET", "/manifests/"+reference)
+	req, err := c.NewRequest("GET", "/manifests/"+reference)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +225,7 @@ func (c *Client) GetManifest(reference string) (*ManifestResult, error) {
 
 // GetConfig fetches the JSON image configuration.
 func (c *Client) GetConfig(digest string, size int64) (*ConfigBlob, []byte, error) {
-	req, err := c.newRequest("GET", "/blobs/"+digest)
+	req, err := c.NewRequest("GET", "/blobs/"+digest)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -269,7 +267,7 @@ func (c *Client) GetConfig(digest string, size int64) (*ConfigBlob, []byte, erro
 
 // DownloadLayer streams a compressed layer blob to the provided io.Writer.
 func (c *Client) DownloadLayer(digest string, expectedSize int64, dest io.Writer) error {
-	req, err := c.newRequest("GET", "/blobs/"+digest)
+	req, err := c.NewRequest("GET", "/blobs/"+digest)
 	if err != nil {
 		return err
 	}
