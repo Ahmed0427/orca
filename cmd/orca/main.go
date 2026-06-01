@@ -11,6 +11,26 @@ import (
 	"github.com/ahmed0427/orca/pkg/image"
 )
 
+func HumanSize(size int64) string {
+	const unit = 1024
+
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+
+	div, exp := int64(unit), 0
+
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+
+	return fmt.Sprintf("%.1f %ciB",
+		float64(size)/float64(div),
+		"KMGTPE"[exp],
+	)
+}
+
 func main() {
 	if err := image.EnsureDirs(); err != nil {
 		log.Fatalf("initialization failed: %v", err)
@@ -29,7 +49,11 @@ func main() {
 		if len(args) < 1 {
 			log.Fatalf("Usage: %s run <image> [command...]\n", os.Args[0])
 		}
-		if err := container.RunImage(args[0], args[1:]); err != nil {
+
+		registry, namespace, repo, tag := image.ParseImageTarget(args[0])
+		fullRef := image.FullRef(registry, namespace, repo, tag)
+
+		if err := container.RunImage(fullRef, args[1:]); err != nil {
 			log.Fatalf("run failed: %v", err)
 		}
 	case "_init_":
@@ -50,9 +74,11 @@ func main() {
 		rmCmd := flag.NewFlagSet("rm", flag.ExitOnError)
 		rmCmd.Parse(os.Args[2:])
 		if rmCmd.NArg() < 1 {
-			log.Fatalf("Usage: %s rm <image:tag>\n", os.Args[0])
+			log.Fatalf("Usage: %s rm <image>\n", os.Args[0])
 		}
-		if err := image.RemoveImage(rmCmd.Arg(0)); err != nil {
+		registry, namespace, repo, tag := image.ParseImageTarget(rmCmd.Arg(0))
+		fullRef := image.FullRef(registry, namespace, repo, tag)
+		if err := image.RemoveImage(fullRef); err != nil {
 			log.Fatalf("remove failed: %v", err)
 		}
 
@@ -62,7 +88,9 @@ func main() {
 		if verifyCmd.NArg() < 1 {
 			log.Fatalf("Usage: %s verify <image:tag>\n", os.Args[0])
 		}
-		err := image.VerifyImage(verifyCmd.Arg(0))
+		registry, namespace, repo, tag := image.ParseImageTarget(verifyCmd.Arg(0))
+		fullRef := image.FullRef(registry, namespace, repo, tag)
+		err := image.VerifyImage(fullRef)
 		if err != nil {
 			if strings.HasPrefix(err.Error(), "image corrupted:") {
 				fmt.Printf("Critical: %v\n", err)
@@ -80,8 +108,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to list images: %v\n", err)
 		}
-		for _, img := range images {
-			fmt.Println(img)
+		fmt.Printf("%-45s %-10s\n", "IMAGE", "DISK USAGE")
+		for _, ref := range images {
+			size, err := image.ImageSize(ref)
+			if err != nil || size == 0 {
+				fmt.Printf("%-45s %-10s\n", ref, "permission denied")
+				continue
+			}
+			fmt.Printf("%-45s %-10s\n", ref, HumanSize(size))
 		}
 
 	case "gc":

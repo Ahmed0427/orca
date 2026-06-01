@@ -10,9 +10,9 @@ import (
 )
 
 func PullImage(target string) error {
-	namespace, repo, tag := ParseImageTarget(target)
+	registry, namespace, repo, tag := ParseImageTarget(target)
 
-	client, err := NewClient(namespace, repo)
+	client, err := NewClient(registry, namespace, repo)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
@@ -22,7 +22,8 @@ func PullImage(target string) error {
 		return fmt.Errorf("failed to get manifest: %w", err)
 	}
 
-	manifestPath := TagPath(fmt.Sprintf("%s:%s", repo, tag))
+	fullRef := FullRef(registry, namespace, repo, tag)
+	manifestPath := TagPath(EncodeRef(fullRef))
 	if err := os.WriteFile(manifestPath, manifestResult.RawBytes, 0644); err != nil {
 		return fmt.Errorf("failed to write manifest: %w", err)
 	}
@@ -37,11 +38,13 @@ func PullImage(target string) error {
 		return fmt.Errorf("failed to write config blob: %w", err)
 	}
 
+	pre := []string{
+		fmt.Sprintf("Pulling from %s", fullRef),
+	}
 	post := []string{
 		fmt.Sprintf("Digest: %s", manifestResult.Digest),
-		fmt.Sprintf("Status: Downloaded newer image for %s:%s", repo, tag),
+		fmt.Sprintf("Status: Downloaded newer image for %s", fullRef),
 	}
-	pre := []string{fmt.Sprintf("Pulling from %s/%s with tag=%s", namespace, repo, tag)}
 	mp := progress.NewMultiProgress(pre, post)
 
 	for _, l := range manifestResult.Manifest.Layers {

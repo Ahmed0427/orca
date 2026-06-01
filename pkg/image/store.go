@@ -25,6 +25,19 @@ func ContainerExists(id string) bool { return PathExists(ContainerPath(id)) }
 
 func LayerID(diffID string) string { return strings.TrimPrefix(diffID, "sha256:")[:12] }
 
+func FullRef(registry, namespace, repo, tag string) string {
+	return fmt.Sprintf("%s/%s/%s:%s", registry, namespace, repo, tag)
+}
+
+func EncodeRef(ref string) string {
+	return hex.EncodeToString([]byte(ref))
+}
+
+func DecodeRef(filename string) string {
+	decodedBytes, _ := hex.DecodeString(filename)
+	return string(decodedBytes)
+}
+
 func EnsureDirs() error {
 	dirs := []string{
 		BasePath,
@@ -41,6 +54,49 @@ func EnsureDirs() error {
 	return nil
 }
 
+func DirSize(path string) (int64, error) {
+	var size int64
+
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			size += info.Size()
+		}
+
+		return nil
+	})
+
+	return size, err
+}
+
+func ImageSize(ref string) (int64, error) {
+	manifest, err := ReadManifest(EncodeRef(ref))
+	if err != nil {
+		return 0, err
+	}
+
+	config, err := ReadConfig(manifest.Config.Digest)
+	if err != nil {
+		return 0, err
+	}
+
+	var total int64
+
+	for _, diffID := range config.Rootfs.DiffIds {
+		size, err := DirSize(LayerPath(LayerID(diffID)))
+		if err != nil {
+			return 0, err
+		}
+
+		total += size
+	}
+
+	return total, nil
+}
+
 func ListImages() ([]string, error) {
 	tagsDir := filepath.Join(BasePath, "tags")
 	if !PathExists(tagsDir) {
@@ -53,7 +109,7 @@ func ListImages() ([]string, error) {
 	var images []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
-			images = append(images, entry.Name())
+			images = append(images, DecodeRef(entry.Name()))
 		}
 	}
 	return images, nil
@@ -88,7 +144,8 @@ func ReadConfig(digest string) (*ConfigBlob, error) {
 	return config, nil
 }
 
-func VerifyImage(tag string) error {
+func VerifyImage(ref string) error {
+	tag := EncodeRef(ref)
 	manifest, err := ReadManifest(tag)
 	if err != nil {
 		return err
@@ -127,37 +184,52 @@ func VerifyImage(tag string) error {
 	return nil
 }
 
-func RemoveImage(tag string) error {
-	p := TagPath(tag)
+func RemoveImage(ref string) error {
+	p := TagPath(EncodeRef(ref))
 	if !PathExists(p) {
-		return fmt.Errorf("image tag %s does not exist", tag)
+		return fmt.Errorf("image tag %s does not exist", ref)
 	}
 	if err := os.Remove(p); err != nil {
-		return fmt.Errorf("failed to remove tag %s: %w", tag, err)
+		return fmt.Errorf("failed to remove tag %s: %w", ref, err)
 	}
-	fmt.Printf("%s image removed successfully\n", tag)
-	return GarbageCollect()
+	fmt.Printf("Untagged: %s\n", ref)
+	deleted, err := GarbageCollectVerbose()
+	if err != nil {
+		return fmt.Errorf("garbage collection failed: %w", err)
+	}
+	for _, d := range deleted {
+		fmt.Printf("Deleted: %s\n", d)
+	}
+
+	return nil
 }
 
 func GarbageCollect() error {
+	_, err := GarbageCollectVerbose()
+	return err
+}
+
+func GarbageCollectVerbose() ([]string, error) {
+	deleted := make([]string, 0)
 	activeBlobs := make(map[string]bool)
 	activeLayers := make(map[string]bool)
 
 	tagsDir := filepath.Join(BasePath, "tags")
 	if !PathExists(tagsDir) {
-		return nil
+		return nil, nil
 	}
 
 	tags, err := os.ReadDir(tagsDir)
 	if err != nil {
-		return fmt.Errorf("failed to read tags directory: %w", err)
+		return nil, fmt.Errorf("failed to read tags directory: %w", err)
 	}
 
 	for _, tagFile := range tags {
 		if tagFile.IsDir() {
 			continue
 		}
-		if err := VerifyImage(tagFile.Name()); err != nil {
+		ref := DecodeRef(tagFile.Name())
+		if err := VerifyImage(ref); err != nil {
 			continue
 		}
 		manifest, err := ReadManifest(tagFile.Name())
@@ -194,10 +266,13 @@ func GarbageCollect() error {
 		if err == nil {
 			for _, l := range layers {
 				if !activeLayers[l.Name()] {
-					_ = os.RemoveAll(filepath.Join(layersDir, l.Name()))
+					err = os.RemoveAll(filepath.Join(layersDir, l.Name()))
+					if err == nil {
+						deleted = append(deleted, l.Name())
+					}
 				}
 			}
 		}
 	}
-	return nil
+	return deleted, nil
 }

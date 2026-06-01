@@ -14,10 +14,9 @@ import (
 )
 
 const (
-	defaultRegistryBase = "https://registry-1.docker.io/v2/"
-	defaultAuthService  = "https://auth.docker.io/token"
-	defaultNamespace    = "library"
-	defaultTag          = "latest"
+	DefaultRegistry  = "docker.io"
+	DefaultNamespace = "library"
+	DefaultTag       = "latest"
 )
 
 var (
@@ -75,19 +74,19 @@ type ConfigBlob struct {
 }
 
 type Client struct {
-	httpClient *http.Client
-	registry   string
-	token      string
-	namespace  string
-	repo       string
+	httpClient  *http.Client
+	registryURL string
+	token       string
+	namespace   string
+	repo        string
 }
 
-func NewClient(namespace, repo string) (*Client, error) {
+func NewClient(registry, namespace, repo string) (*Client, error) {
 	c := &Client{
-		httpClient: &http.Client{},
-		registry:   defaultRegistryBase,
-		namespace:  namespace,
-		repo:       repo,
+		httpClient:  &http.Client{},
+		registryURL: ResolveRegistryURL(registry),
+		namespace:   namespace,
+		repo:        repo,
 	}
 
 	if err := c.Authenticate(); err != nil {
@@ -96,59 +95,116 @@ func NewClient(namespace, repo string) (*Client, error) {
 	return c, nil
 }
 
-func ParseImageTarget(targetImage string) (string, string, string) {
-	var namespace, repo, tag string
+func ResolveRegistryURL(registry string) string {
+	switch registry {
+	case "docker.io", "index.docker.io":
+		return "https://registry-1.docker.io/v2/"
+	default:
+		return "https://" + registry + "/v2/"
+	}
+}
 
+func ParseImageTarget(targetImage string) (registry, namespace, repo, tag string) {
+	tag = DefaultTag
 	colonIndex := strings.LastIndex(targetImage, ":")
-	if colonIndex != -1 {
+	if colonIndex != -1 && !strings.Contains(targetImage[colonIndex:], "/") {
 		tag = targetImage[colonIndex+1:]
 		targetImage = targetImage[:colonIndex]
-	} else {
-		tag = defaultTag
 	}
 
-	slashIndex := strings.Index(targetImage, "/")
-	if slashIndex != -1 {
-		namespace = targetImage[:slashIndex]
-		repo = targetImage[slashIndex+1:]
+	parts := strings.Split(targetImage, "/")
+
+	if len(parts) > 0 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":")) {
+		registry = parts[0]
+		parts = parts[1:]
 	} else {
-		namespace = defaultNamespace
-		repo = targetImage
+		registry = DefaultRegistry
 	}
 
-	return namespace, repo, tag
+	if len(parts) == 1 {
+		namespace = DefaultNamespace
+		repo = parts[0]
+	} else {
+		namespace = parts[0]
+		repo = strings.Join(parts[1:], "/")
+	}
+
+	return registry, namespace, repo, tag
+}
+
+func ParseAuthChallenge(header string) (realm, service string) {
+	header = strings.TrimPrefix(header, "Bearer ")
+	parts := strings.Split(header, ",")
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "realm=") {
+			realm = strings.Trim(strings.TrimPrefix(part, "realm="), `"`)
+		} else if strings.HasPrefix(part, "service=") {
+			service = strings.Trim(strings.TrimPrefix(part, "service="), `"`)
+		}
+	}
+	return realm, service
+}
+
+func (c *Client) NewRequest(method, endpoint string) (*http.Request, error) {
+	req, err := http.NewRequest(method, c.registryURL+c.namespace+"/"+c.repo+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return req, nil
 }
 
 func (c *Client) Authenticate() error {
-	url := fmt.Sprintf("%s?service=registry.docker.io&scope=repository:%s:pull",
-		defaultAuthService, fmt.Sprintf("%s/%s", c.namespace, c.repo))
-
-	resp, err := c.httpClient.Get(url)
+	pingURL := c.registryURL
+	pingResp, err := c.httpClient.Get(pingURL)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer pingResp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("auth service returned status: %d", resp.StatusCode)
+	if pingResp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	if pingResp.StatusCode != http.StatusUnauthorized {
+		return fmt.Errorf("unexpected status from registry ping: %d", pingResp.StatusCode)
+	}
+
+	authHeader := pingResp.Header.Get("Www-Authenticate")
+	if authHeader == "" {
+		return errors.New("registry returned 401 but no Www-Authenticate header")
+	}
+
+	realm, service := ParseAuthChallenge(authHeader)
+	if realm == "" {
+		return errors.New("could not find 'realm' in Www-Authenticate header")
+	}
+
+	scope := fmt.Sprintf("repository:%s/%s:pull", c.namespace, c.repo)
+
+	tokenURL := fmt.Sprintf("%s?service=%s&scope=%s", realm, service, scope)
+
+	tokenResp, err := c.httpClient.Get(tokenURL)
+	if err != nil {
+		return err
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("auth service returned status: %d", tokenResp.StatusCode)
 	}
 
 	var authResp AuthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&authResp); err != nil {
+	if err := json.NewDecoder(tokenResp.Body).Decode(&authResp); err != nil {
 		return err
 	}
 
 	c.token = authResp.Token
 	return nil
-}
-
-func (c *Client) NewRequest(method, endpoint string) (*http.Request, error) {
-	req, err := http.NewRequest(method, c.registry+c.namespace+"/"+c.repo+endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	return req, nil
 }
 
 type ManifestResult struct {
