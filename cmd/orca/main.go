@@ -12,7 +12,7 @@ import (
 )
 
 func HumanSize(size int64) string {
-	const unit = 1024
+	const unit = 1000
 
 	if size < unit {
 		return fmt.Sprintf("%d B", size)
@@ -25,7 +25,7 @@ func HumanSize(size int64) string {
 		exp++
 	}
 
-	return fmt.Sprintf("%.1f %ciB",
+	return fmt.Sprintf("%.2f%cB",
 		float64(size)/float64(div),
 		"KMGTPE"[exp],
 	)

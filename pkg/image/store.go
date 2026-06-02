@@ -83,7 +83,16 @@ func ImageSize(ref string) (int64, error) {
 		return 0, err
 	}
 
-	var total int64
+	manifestSize, err := GetManifestSize(EncodeRef(ref))
+	if err != nil {
+		return 0, err
+	}
+	configSize, err := GetConfigSize(manifest.Config.Digest)
+	if err != nil {
+		return 0, err
+	}
+
+	var total int64 = manifestSize + configSize
 
 	for _, diffID := range config.Rootfs.DiffIds {
 		size, err := DirSize(LayerPath(LayerID(diffID)))
@@ -132,6 +141,17 @@ func ReadManifest(tag string) (*ManifestResponse, error) {
 	return manifest, nil
 }
 
+func GetManifestSize(tag string) (int64, error) {
+	info, err := os.Stat(TagPath(tag))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, fmt.Errorf("image %s not found", tag)
+		}
+		return 0, fmt.Errorf("failed to get manifest size: %w", err)
+	}
+	return info.Size(), nil
+}
+
 func ReadConfig(digest string) (*ConfigBlob, error) {
 	configBytes, err := os.ReadFile(BlobPath(digest))
 	if err != nil {
@@ -142,6 +162,14 @@ func ReadConfig(digest string) (*ConfigBlob, error) {
 		return nil, fmt.Errorf("image corrupted: invalid config JSON: %w", err)
 	}
 	return config, nil
+}
+
+func GetConfigSize(digest string) (int64, error) {
+	info, err := os.Stat(BlobPath(digest))
+	if err != nil {
+		return 0, fmt.Errorf("failed to get config file size: %w", err)
+	}
+	return info.Size(), nil
 }
 
 func VerifyImage(ref string) error {
