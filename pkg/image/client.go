@@ -125,8 +125,8 @@ func ParseImageTarget(targetImage string) (registry, namespace, repo, tag string
 		namespace = DefaultNamespace
 		repo = parts[0]
 	} else {
-		namespace = parts[0]
-		repo = strings.Join(parts[1:], "/")
+		namespace = strings.Join(parts[0:len(parts)-1], "/")
+		repo = parts[len(parts)-1]
 	}
 
 	return registry, namespace, repo, tag
