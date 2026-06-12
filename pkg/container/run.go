@@ -5,240 +5,447 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/ahmed0427/orca/pkg/image"
+	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
+// ───────────────────────────────────────────────────────────────────
+// Types
+// ───────────────────────────────────────────────────────────────────
+
 type CgroupSpecs struct {
-	MemoryMax string
-	CPUMax    string
-	PidsMax   string
+	MemoryMax, CPUMax, PidsMax string
+}
+
+type RunOptions struct {
+	Interactive bool
+	TTY         bool
+	Detach      bool
+	Name        string
+	Hostname    string
+	Limits      CgroupSpecs
 }
 
 type ContainerConfig struct {
-	Name    string      `json:"name"`
-	Cmd     []string    `json:"args"`
-	Env     []string    `json:"env"`
-	RootDir string      `json:"root_dir"`
-	Limits  CgroupSpecs `json:"limits"`
+	Name     string
+	Hostname string
+	Cmd      []string
+	Env      []string
+	RootDir  string
+	Limits   CgroupSpecs
+	TTY      bool
 }
 
-const (
-	cgroupPath   = "/sys/fs/cgroup"
-	configEnvVar = "CONTAINER_CONFIG"
+const cgroupRoot = "/sys/fs/cgroup"
+
+var (
+	sentinelShim = "_shim_"
+	sentinelInit = "_init_"
 )
 
-func GenerateHexID() (string, error) {
-	bytes := make([]byte, 6)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(bytes), nil
-}
+// ───────────────────────────────────────────────────────────────────
+// Public entry point
+// ───────────────────────────────────────────────────────────────────
 
-func CreatContainerDir() (string, error) {
-	id, err := GenerateHexID()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate hex ID")
+func RunImage(tag string, userCmd []string, opts RunOptions) error {
+	if opts.Detach && opts.Interactive {
+		return fmt.Errorf("cannot combine -d with -i")
 	}
 
-	containerPath := image.ContainerPath(id)
-	if err := os.MkdirAll(containerPath, 0755); err != nil {
-		return "", fmt.Errorf("failed to create directory %s: %w", containerPath, err)
-	}
-
-	return id, nil
-}
-
-func MountOverlayFS(id, tag string, config *image.ConfigBlob) error {
-	var lowerDirs []string
-	for _, diffId := range config.Rootfs.DiffIds {
-		layerID := image.LayerID(diffId)
-		layerDir := image.LayerPath(layerID)
-		if !image.LayerExists(layerID) {
-			return fmt.Errorf("%s is corrupted: layer %s don't exists", tag, layerID)
-		}
-		lowerDirs = append([]string{layerDir}, lowerDirs...)
-	}
-
-	containerPath := image.ContainerPath(id)
-	upperDir := filepath.Join(containerPath, "upper")
-	workDir := filepath.Join(containerPath, "work")
-	rootDir := filepath.Join(containerPath, "root")
-
-	for _, dir := range []string{upperDir, workDir, rootDir} {
-		os.MkdirAll(dir, 0755)
-	}
-
-	mountOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
-		strings.Join(lowerDirs, ":"), upperDir, workDir)
-
-	if err := unix.Mount("overlay", rootDir, "overlay", 0, mountOpts); err != nil {
-		return fmt.Errorf("overlay mount failed: %v", err)
-	}
-
-	return nil
-}
-
-func RunImage(tag string, userCmd []string) error {
-	manifest, err := image.ReadManifest(tag)
+	manifest, err := image.ReadManifest(image.EncodeRef(tag))
 	if err != nil {
 		return err
 	}
-	config, err := image.ReadConfig(manifest.Config.Digest)
+	cfg, err := image.ReadConfig(manifest.Config.Digest)
 	if err != nil {
 		return err
 	}
 
-	id, err := CreatContainerDir()
+	id, err := createContainerDir()
 	if err != nil {
-		return fmt.Errorf("failed to creat container dir: %w", err)
+		return err
 	}
-
-	err = MountOverlayFS(id, tag, config)
-	if err != nil {
+	if err := mountOverlay(id, tag, cfg); err != nil {
 		return err
 	}
 
 	containerPath := image.ContainerPath(id)
 	rootDir := filepath.Join(containerPath, "root")
 
-	cmd := config.Config.Cmd
+	cmd := cfg.Config.Cmd
 	if len(userCmd) > 0 {
 		cmd = userCmd
 	}
+	env := append(cfg.Config.Env, "TERM="+os.Getenv("TERM"))
 
-	Run(id, cmd, config.Config.Env, rootDir, CgroupSpecs{})
-	return nil
+	name := opts.Name
+	if name == "" {
+		name = id
+	}
+	hostname := opts.Hostname
+	if hostname == "" {
+		hostname = name
+	}
+
+	cc := ContainerConfig{
+		Name:     name,
+		Hostname: hostname,
+		Cmd:      cmd,
+		Env:      env,
+		RootDir:  rootDir,
+		Limits:   opts.Limits,
+		TTY:      opts.TTY,
+	}
+
+	// Persist config for the re-execed init process
+	configPath := filepath.Join(containerPath, "config.json")
+	b, _ := json.Marshal(cc)
+	if err := os.WriteFile(configPath, b, 0600); err != nil {
+		return err
+	}
+
+	if opts.Detach {
+		return startDetached(id, cc)
+	}
+	return startAttached(id, cc, opts)
 }
 
-func Run(name string, cmdArgs []string, env []string, rootDir string, limits CgroupSpecs) {
-	env = append(env, fmt.Sprintf("TERM=%s", os.Getenv("TERM")))
+// ───────────────────────────────────────────────────────────────────
+// Attached (foreground) run
+// ───────────────────────────────────────────────────────────────────
 
-	config := ContainerConfig{
-		Name:    name,
-		Cmd:     cmdArgs,
-		Env:     env,
-		RootDir: rootDir,
-		Limits:  limits,
-	}
-
-	configBytes, err := json.Marshal(config)
-	if err != nil {
-		log.Fatalf("failed to marshal container config: %v", err)
-	}
-
-	exeCmd := exec.Command("/proc/self/exe", "_init_")
-	exeCmd.Stdin, exeCmd.Stdout, exeCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-
-	exeCmd.Env = append(os.Environ(), fmt.Sprintf("%s=%s", configEnvVar, string(configBytes)))
-
+func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
+	exeCmd := exec.Command("/proc/self/exe", sentinelInit)
 	exeCmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUTS |
 			syscall.CLONE_NEWPID |
 			syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWNET,
+			syscall.CLONE_NEWNET |
+			syscall.CLONE_NEWIPC,
 	}
+	configPath := filepath.Join(image.ContainerPath(id), "config.json")
+	exeCmd.Env = append(os.Environ(), "ORCA_CONFIG_PATH="+configPath)
 
-	if err := exeCmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+	var err error
+	var ptm, pts *os.File
+	usePTY := opts.Interactive && opts.TTY
+
+	if usePTY {
+		ptm, pts, err = pty.Open()
+		if err != nil {
+			return fmt.Errorf("pty open: %w", err)
 		}
-		log.Fatalf("Container runtime error: %v", err)
+		exeCmd.SysProcAttr.Setsid = true
+		exeCmd.SysProcAttr.Setctty = true
+		exeCmd.Stdin = pts
+		exeCmd.Stdout = pts
+		exeCmd.Stderr = pts
+
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			pts.Close()
+			ptm.Close()
+			return fmt.Errorf("term raw: %w", err)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+		if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+			pty.Setsize(ptm, ws)
+		}
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGWINCH)
+		defer signal.Stop(sigCh)
+		go func() {
+			for range sigCh {
+				if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+					pty.Setsize(ptm, ws)
+				}
+			}
+		}()
+
+		// ----- FIX: close ptm after container exits to unblock I/O copies -----
+		// Remove the defer ptm.Close() so we can control timing.
+		// Start the I/O pumps
+		go io.Copy(ptm, os.Stdin)
+		go io.Copy(os.Stdout, ptm)
+
+		if err := exeCmd.Start(); err != nil {
+			pts.Close()
+			ptm.Close()
+			return fmt.Errorf("start container: %w", err)
+		}
+
+		// Wait for the container process
+		err = exeCmd.Wait()
+
+		// Now close the master – this will cause io.Copy goroutines to receive EOF/error
+		ptm.Close()
+		pts.Close()
+
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			return err
+		}
+		return nil
+
+	} else {
+		// Non-PTY path unchanged
+		if opts.Interactive {
+			exeCmd.Stdin = os.Stdin
+		} else {
+			exeCmd.Stdin, _ = os.Open(os.DevNull)
+		}
+		exeCmd.Stdout = os.Stdout
+		exeCmd.Stderr = os.Stderr
+
+		if err := exeCmd.Start(); err != nil {
+			return fmt.Errorf("start container: %w", err)
+		}
+		sigChan := make(chan os.Signal, 32)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+		defer signal.Stop(sigChan)
+		go func() {
+			for sig := range sigChan {
+				exeCmd.Process.Signal(sig)
+			}
+		}()
+
+		err := exeCmd.Wait()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			return err
+		}
+		return nil
 	}
 }
+
+// ───────────────────────────────────────────────────────────────────
+// Detached (background) run
+// ───────────────────────────────────────────────────────────────────
+
+func startDetached(id string, cc ContainerConfig) error {
+	stateDir := image.ContainerPath(id)
+
+	shimLog, err := os.Create(filepath.Join(stateDir, "shim.log"))
+	if err != nil {
+		return err
+	}
+
+	shimCmd := exec.Command("/proc/self/exe", sentinelShim, id)
+	shimCmd.Stdout = shimLog
+	shimCmd.Stderr = shimLog
+	shimCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := shimCmd.Start(); err != nil {
+		return err
+	}
+	shimCmd.Process.Release() // reparent to init
+
+	fmt.Println(id)
+	return nil
+}
+
+// RunShim is the long-lived detached runner
+func RunShim(id string) error {
+	stateDir := image.ContainerPath(id)
+
+	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
+	if err != nil {
+		return fmt.Errorf("shim config: %w", err)
+	}
+	var cc ContainerConfig
+	if err := json.Unmarshal(configBytes, &cc); err != nil {
+		return err
+	}
+
+	outLog, err := os.OpenFile(filepath.Join(stateDir, "output.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer outLog.Close()
+
+	exeCmd := exec.Command("/proc/self/exe", sentinelInit)
+	exeCmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUTS |
+			syscall.CLONE_NEWPID |
+			syscall.CLONE_NEWNS |
+			syscall.CLONE_NEWNET |
+			syscall.CLONE_NEWIPC,
+	}
+	exeCmd.Env = append(os.Environ(),
+		"ORCA_CONFIG_PATH="+filepath.Join(stateDir, "config.json"))
+	devNull, _ := os.Open(os.DevNull)
+	exeCmd.Stdin = devNull
+	exeCmd.Stdout = outLog
+	exeCmd.Stderr = outLog
+
+	if err := exeCmd.Start(); err != nil {
+		return err
+	}
+	pidPath := filepath.Join(stateDir, "container.pid")
+	os.WriteFile(pidPath, []byte(strconv.Itoa(exeCmd.Process.Pid)), 0644)
+
+	err = exeCmd.Wait()
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
+	}
+	return os.WriteFile(filepath.Join(stateDir, "exit-code"),
+		[]byte(strconv.Itoa(exitCode)), 0644)
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Re‑execed init: runs inside new namespaces
+// ───────────────────────────────────────────────────────────────────
 
 func Init() error {
-	configRaw := os.Getenv(configEnvVar)
-	if configRaw == "" {
-		return fmt.Errorf("container init failed: missing configuration context")
-	}
-	_ = os.Unsetenv(configEnvVar)
-
-	var config ContainerConfig
-	if err := json.Unmarshal([]byte(configRaw), &config); err != nil {
-		return fmt.Errorf("container init failed to parse config: %v", err)
+	configPath := os.Getenv("ORCA_CONFIG_PATH")
+	if configPath == "" {
+		return fmt.Errorf("no config path")
 	}
 
-	if err := ApplyCgroups(config.Name, config.Limits); err != nil {
-		log.Printf("Warning: failed to enforce cgroups: %v", err)
-	}
-
-	if err := syscall.Sethostname([]byte(config.Name)); err != nil {
-		return fmt.Errorf("failed to set hostname: %v", err)
-	}
-
-	if err := syscall.Chroot(config.RootDir); err != nil {
-		return fmt.Errorf("failed to chroot to %s: %v", config.RootDir, err)
-	}
-
-	if err := syscall.Chdir("/"); err != nil {
-		return fmt.Errorf("failed to change directory to root: %v", err)
-	}
-
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		return fmt.Errorf("failed to mount /proc: %v", err)
-	}
-
-	defer syscall.Unmount("/proc", 0)
-
-	ExecutePayload(config)
-	return nil
-}
-
-func ApplyCgroups(name string, limits CgroupSpecs) error {
-	cgroupDir := filepath.Join(cgroupPath, "orca", name)
-	if err := os.MkdirAll(cgroupDir, 0755); err != nil {
-		return fmt.Errorf("failed to create cgroup directory: %w", err)
-	}
-
-	pid := strconv.Itoa(os.Getpid())
-	err := os.WriteFile(filepath.Join(cgroupDir, "cgroup.procs"), []byte(pid), 0644)
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return fmt.Errorf("failed to join cgroup: %w", err)
+		return err
+	}
+	var cfg ContainerConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return err
 	}
 
-	if limits.CPUMax != "" {
-		_ = os.WriteFile(filepath.Join(cgroupDir, "cpu.max"), []byte(limits.CPUMax), 0644)
+	// Apply cgroups before mount because we are in the new PID ns
+	if err := applyCgroups(cfg.Name, cfg.Limits); err != nil {
+		log.Printf("warning: cgroup apply failed: %v", err)
 	}
 
-	pidsLimit := "max"
-	if limits.PidsMax != "" {
-		pidsLimit = limits.PidsMax
-	}
-	memoryLimit := "max"
-	if limits.MemoryMax != "" {
-		memoryLimit = limits.MemoryMax
+	if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
+		return err
 	}
 
-	_ = os.WriteFile(filepath.Join(cgroupDir, "pids.max"), []byte(pidsLimit), 0644)
-	_ = os.WriteFile(filepath.Join(cgroupDir, "memory.max"), []byte(memoryLimit), 0644)
+	procTarget := filepath.Join(cfg.RootDir, "proc")
+	if err := syscall.Mount("proc", procTarget, "proc", 0, ""); err != nil {
+		return err
+	}
 
+	// Change root into the container filesystem using only chroot
+	if err := changeRoot(cfg.RootDir); err != nil {
+		return err
+	}
+
+	path, err := exec.LookPath(cfg.Cmd[0])
+	if err != nil {
+		log.Fatalf("command not found: %v", err)
+	}
+	return syscall.Exec(path, cfg.Cmd, append(cfg.Env, "HOSTNAME="+cfg.Hostname))
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Helper: chroot + chdir
+// ───────────────────────────────────────────────────────────────────
+
+func changeRoot(newRoot string) error {
+	if err := syscall.Chroot(newRoot); err != nil {
+		return fmt.Errorf("chroot failed: %w", err)
+	}
+	if err := syscall.Chdir("/"); err != nil {
+		return fmt.Errorf("chdir after chroot failed: %w", err)
+	}
 	return nil
 }
 
-func ExecutePayload(c ContainerConfig) {
-	if len(c.Cmd) == 0 {
-		log.Fatalf("Execution failure: no command provided")
+// ───────────────────────────────────────────────────────────────────
+// Cgroup v2 setup
+// ───────────────────────────────────────────────────────────────────
+
+func applyCgroups(name string, limits CgroupSpecs) error {
+	parent := filepath.Join(cgroupRoot, "orca")
+	leaf := filepath.Join(parent, name)
+
+	os.MkdirAll(parent, 0755)
+	// Enable controllers in parent
+	os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"),
+		[]byte("+cpu +memory +pids"), 0644)
+
+	os.Mkdir(leaf, 0755)
+
+	write := func(file, val string) {
+		os.WriteFile(filepath.Join(leaf, file), []byte(val), 0644)
 	}
+	write("memory.max", ifEmpty(limits.MemoryMax, "max"))
+	write("pids.max", ifEmpty(limits.PidsMax, "max"))
+	if limits.CPUMax != "" {
+		write("cpu.max", limits.CPUMax)
+	}
+	return os.WriteFile(filepath.Join(leaf, "cgroup.procs"),
+		[]byte(strconv.Itoa(os.Getpid())), 0644)
+}
 
-	cmd := exec.Command(c.Cmd[0], c.Cmd[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.Env = append(cmd.Env, c.Env...)
-	cmd.Env = append(cmd.Env, fmt.Sprintf("HOSTNAME=%s", c.Name))
+// ───────────────────────────────────────────────────────────────────
+// Image layer & filesystem helpers
+// ───────────────────────────────────────────────────────────────────
 
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+func createContainerDir() (string, error) {
+	id := genHexID()
+	path := image.ContainerPath(id)
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func mountOverlay(id, tag string, cfg *image.ConfigBlob) error {
+	var lowers []string
+	for _, diffID := range cfg.Rootfs.DiffIds {
+		layerID := image.LayerID(diffID)
+		if !image.LayerExists(layerID) {
+			return fmt.Errorf("layer %s missing", layerID)
 		}
-		log.Fatalf("Execution failure: %v", err)
+		lowers = append([]string{image.LayerPath(layerID)}, lowers...)
 	}
+	containerPath := image.ContainerPath(id)
+	upper := filepath.Join(containerPath, "upper")
+	work := filepath.Join(containerPath, "work")
+	root := filepath.Join(containerPath, "root")
+	for _, d := range []string{upper, work, root} {
+		os.MkdirAll(d, 0755)
+	}
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s",
+		strings.Join(lowers, ":"), upper, work)
+	return unix.Mount("overlay", root, "overlay", 0, opts)
+}
+
+func genHexID() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto rand failed")
+	}
+	return hex.EncodeToString(b)
+}
+
+func ifEmpty(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
