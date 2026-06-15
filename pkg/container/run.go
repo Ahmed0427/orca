@@ -21,10 +21,6 @@ import (
 	"golang.org/x/term"
 )
 
-// ───────────────────────────────────────────────────────────────────
-// Types
-// ───────────────────────────────────────────────────────────────────
-
 type CgroupSpecs struct {
 	MemoryMax, CPUMax, PidsMax string
 }
@@ -49,15 +45,16 @@ type ContainerConfig struct {
 }
 
 const cgroupRoot = "/sys/fs/cgroup"
+const cloneflags = syscall.CLONE_NEWNS |
+	syscall.CLONE_NEWUTS |
+	syscall.CLONE_NEWPID |
+	syscall.CLONE_NEWNET |
+	syscall.CLONE_NEWIPC
 
 var (
 	sentinelShim = "_shim_"
 	sentinelInit = "_init_"
 )
-
-// ───────────────────────────────────────────────────────────────────
-// Public entry point
-// ───────────────────────────────────────────────────────────────────
 
 func RunImage(tag string, userCmd []string, opts RunOptions) error {
 	if opts.Detach && opts.Interactive {
@@ -109,7 +106,6 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 		TTY:      opts.TTY,
 	}
 
-	// Persist config for the re-execed init process
 	configPath := filepath.Join(containerPath, "config.json")
 	b, _ := json.Marshal(cc)
 	if err := os.WriteFile(configPath, b, 0600); err != nil {
@@ -122,21 +118,11 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 	return startAttached(id, cc, opts)
 }
 
-// ───────────────────────────────────────────────────────────────────
-// Attached (foreground) run
-// ───────────────────────────────────────────────────────────────────
-
 func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
-	exeCmd := exec.Command("/proc/self/exe", sentinelInit)
+	exeCmd := exec.Command("/proc/self/exe", sentinelInit, id)
 	exeCmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS |
-			syscall.CLONE_NEWPID |
-			syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWNET |
-			syscall.CLONE_NEWIPC,
+		Cloneflags: cloneflags,
 	}
-	configPath := filepath.Join(image.ContainerPath(id), "config.json")
-	exeCmd.Env = append(os.Environ(), "ORCA_CONFIG_PATH="+configPath)
 
 	var err error
 	var ptm, pts *os.File
@@ -147,11 +133,12 @@ func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
 		if err != nil {
 			return fmt.Errorf("pty open: %w", err)
 		}
-		exeCmd.SysProcAttr.Setsid = true
-		exeCmd.SysProcAttr.Setctty = true
 		exeCmd.Stdin = pts
 		exeCmd.Stdout = pts
 		exeCmd.Stderr = pts
+
+		exeCmd.SysProcAttr.Setsid = true
+		exeCmd.SysProcAttr.Setctty = true
 
 		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
@@ -175,7 +162,7 @@ func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
 			}
 		}()
 
-		// ----- FIX: close ptm after container exits to unblock I/O copies -----
+		// close ptm after container exits to unblock I/O copies.
 		// Remove the defer ptm.Close() so we can control timing.
 		// Start the I/O pumps
 		go io.Copy(ptm, os.Stdin)
@@ -190,7 +177,7 @@ func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
 		// Wait for the container process
 		err = exeCmd.Wait()
 
-		// Now close the master – this will cause io.Copy goroutines to receive EOF/error
+		// now close the master, this will cause io.Copy goroutines to receive EOF/error
 		ptm.Close()
 		pts.Close()
 
@@ -203,7 +190,6 @@ func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
 		return nil
 
 	} else {
-		// Non-PTY path unchanged
 		if opts.Interactive {
 			exeCmd.Stdin = os.Stdin
 		} else {
@@ -213,6 +199,7 @@ func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
 		exeCmd.Stderr = os.Stderr
 
 		if err := exeCmd.Start(); err != nil {
+			fmt.Println("HERE")
 			return fmt.Errorf("start container: %w", err)
 		}
 		sigChan := make(chan os.Signal, 32)
@@ -235,10 +222,6 @@ func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
 	}
 }
 
-// ───────────────────────────────────────────────────────────────────
-// Detached (background) run
-// ───────────────────────────────────────────────────────────────────
-
 func startDetached(id string, cc ContainerConfig) error {
 	stateDir := image.ContainerPath(id)
 
@@ -248,9 +231,11 @@ func startDetached(id string, cc ContainerConfig) error {
 	}
 
 	shimCmd := exec.Command("/proc/self/exe", sentinelShim, id)
+	shimCmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true,
+	}
 	shimCmd.Stdout = shimLog
 	shimCmd.Stderr = shimLog
-	shimCmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := shimCmd.Start(); err != nil {
 		return err
@@ -261,7 +246,6 @@ func startDetached(id string, cc ContainerConfig) error {
 	return nil
 }
 
-// RunShim is the long-lived detached runner
 func RunShim(id string) error {
 	stateDir := image.ContainerPath(id)
 
@@ -276,22 +260,17 @@ func RunShim(id string) error {
 
 	outLog, err := os.OpenFile(filepath.Join(stateDir, "output.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+
 	if err != nil {
 		return err
 	}
 	defer outLog.Close()
 
-	exeCmd := exec.Command("/proc/self/exe", sentinelInit)
-	exeCmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS |
-			syscall.CLONE_NEWPID |
-			syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWNET |
-			syscall.CLONE_NEWIPC,
-	}
-	exeCmd.Env = append(os.Environ(),
-		"ORCA_CONFIG_PATH="+filepath.Join(stateDir, "config.json"))
 	devNull, _ := os.Open(os.DevNull)
+	exeCmd := exec.Command("/proc/self/exe", sentinelInit, id)
+	exeCmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: cloneflags,
+	}
 	exeCmd.Stdin = devNull
 	exeCmd.Stdout = outLog
 	exeCmd.Stderr = outLog
@@ -315,16 +294,8 @@ func RunShim(id string) error {
 		[]byte(strconv.Itoa(exitCode)), 0644)
 }
 
-// ───────────────────────────────────────────────────────────────────
-// Re‑execed init: runs inside new namespaces
-// ───────────────────────────────────────────────────────────────────
-
-func Init() error {
-	configPath := os.Getenv("ORCA_CONFIG_PATH")
-	if configPath == "" {
-		return fmt.Errorf("no config path")
-	}
-
+func Init(id string) error {
+	configPath := fmt.Sprintf("%v/config.json", image.ContainerPath(id))
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return err
@@ -334,7 +305,6 @@ func Init() error {
 		return err
 	}
 
-	// Apply cgroups before mount because we are in the new PID ns
 	if err := applyCgroups(cfg.Name, cfg.Limits); err != nil {
 		log.Printf("warning: cgroup apply failed: %v", err)
 	}
@@ -348,7 +318,6 @@ func Init() error {
 		return err
 	}
 
-	// Change root into the container filesystem using only chroot
 	if err := changeRoot(cfg.RootDir); err != nil {
 		return err
 	}
@@ -360,10 +329,6 @@ func Init() error {
 	return syscall.Exec(path, cfg.Cmd, append(cfg.Env, "HOSTNAME="+cfg.Hostname))
 }
 
-// ───────────────────────────────────────────────────────────────────
-// Helper: chroot + chdir
-// ───────────────────────────────────────────────────────────────────
-
 func changeRoot(newRoot string) error {
 	if err := syscall.Chroot(newRoot); err != nil {
 		return fmt.Errorf("chroot failed: %w", err)
@@ -374,16 +339,11 @@ func changeRoot(newRoot string) error {
 	return nil
 }
 
-// ───────────────────────────────────────────────────────────────────
-// Cgroup v2 setup
-// ───────────────────────────────────────────────────────────────────
-
 func applyCgroups(name string, limits CgroupSpecs) error {
 	parent := filepath.Join(cgroupRoot, "orca")
 	leaf := filepath.Join(parent, name)
 
 	os.MkdirAll(parent, 0755)
-	// Enable controllers in parent
 	os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"),
 		[]byte("+cpu +memory +pids"), 0644)
 
@@ -400,10 +360,6 @@ func applyCgroups(name string, limits CgroupSpecs) error {
 	return os.WriteFile(filepath.Join(leaf, "cgroup.procs"),
 		[]byte(strconv.Itoa(os.Getpid())), 0644)
 }
-
-// ───────────────────────────────────────────────────────────────────
-// Image layer & filesystem helpers
-// ───────────────────────────────────────────────────────────────────
 
 func createContainerDir() (string, error) {
 	id := genHexID()

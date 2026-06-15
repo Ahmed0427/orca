@@ -26,7 +26,7 @@ func main() {
 	// internal sentinel commands
 	switch cmd {
 	case "_init_":
-		if err := container.Init(); err != nil {
+		if err := container.Init(os.Args[2]); err != nil {
 			log.Printf("_init_ failed: %v", err)
 			os.Exit(1)
 		}
