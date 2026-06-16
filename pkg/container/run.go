@@ -125,109 +125,110 @@ func StartAttached(id string, cc ContainerConfig, opts RunOptions) error {
 	exeCmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: Cloneflags,
 	}
-
-	var err error
-	var ptm, pts *os.File
-	usePTY := opts.Interactive && opts.TTY
-
-	if usePTY {
-		ptm, pts, err = pty.Open()
-		if err != nil {
-			return fmt.Errorf("pty open: %w", err)
-		}
-		exeCmd.Stdin = pts
-		exeCmd.Stdout = pts
-		exeCmd.Stderr = pts
-
-		exeCmd.SysProcAttr.Setsid = true
-		exeCmd.SysProcAttr.Setctty = true
-
-		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-		if err != nil {
-			pts.Close()
-			ptm.Close()
-			return fmt.Errorf("term raw: %w", err)
-		}
-		defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-		if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
-			pty.Setsize(ptm, ws)
-		}
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGWINCH)
-		defer signal.Stop(sigCh)
-		go func() {
-			for range sigCh {
-				if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
-					pty.Setsize(ptm, ws)
-				}
-			}
-		}()
-
-		// close ptm after container exits to unblock I/O copies.
-		// Remove the defer ptm.Close() so we can control timing.
-		// Start the I/O pumps
-		go io.Copy(ptm, os.Stdin)
-		go io.Copy(os.Stdout, ptm)
-
-		if err := exeCmd.Start(); err != nil {
-			pts.Close()
-			ptm.Close()
-			return fmt.Errorf("start container: %w", err)
-		}
-
-		// Wait for the container process
-		err = exeCmd.Wait()
-
-		// now close the master, this will cause io.Copy goroutines to receive EOF/error
-		ptm.Close()
-		pts.Close()
-
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				os.Exit(exitErr.ExitCode())
-			}
-			return err
-		}
-		return nil
-
-	} else {
-		if opts.Interactive {
-			exeCmd.Stdin = os.Stdin
-		} else {
-			exeCmd.Stdin, _ = os.Open(os.DevNull)
-		}
-		exeCmd.Stdout = os.Stdout
-		exeCmd.Stderr = os.Stderr
-
-		if err := exeCmd.Start(); err != nil {
-			fmt.Println("HERE")
-			return fmt.Errorf("start container: %w", err)
-		}
-		sigChan := make(chan os.Signal, 32)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
-		defer signal.Stop(sigChan)
-		go func() {
-			for sig := range sigChan {
-				exeCmd.Process.Signal(sig)
-			}
-		}()
-
-		err := exeCmd.Wait()
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				os.Exit(exitErr.ExitCode())
-			}
-			return err
-		}
-		return nil
+	if !opts.Interactive || !opts.TTY {
+		return StartWithoutPTY(exeCmd, opts.Interactive)
 	}
+	return StartWithPTY(exeCmd)
+}
+
+func StartWithPTY(exeCmd *exec.Cmd) error {
+	ptm, pts, err := pty.Open()
+	if err != nil {
+		return fmt.Errorf("pty open: %w", err)
+	}
+
+	exeCmd.Stdin = pts
+	exeCmd.Stdout = pts
+	exeCmd.Stderr = pts
+	exeCmd.SysProcAttr.Setsid = true
+	exeCmd.SysProcAttr.Setctty = true
+
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		pts.Close()
+		ptm.Close()
+		return fmt.Errorf("term raw: %w", err)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	// propagate initial window size
+	if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+		pty.Setsize(ptm, ws)
+	}
+
+	// listen for SIGWINCH and update pty size
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGWINCH)
+	defer signal.Stop(sigCh)
+	go func() {
+		for range sigCh {
+			if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+				pty.Setsize(ptm, ws)
+			}
+		}
+	}()
+
+	go io.Copy(ptm, os.Stdin)
+	go io.Copy(os.Stdout, ptm)
+
+	if err := exeCmd.Start(); err != nil {
+		pts.Close()
+		ptm.Close()
+		return fmt.Errorf("start container: %w", err)
+	}
+
+	err = exeCmd.Wait()
+
+	// closing the master causes the io.Copy goroutines to see EOF/error
+	ptm.Close()
+	pts.Close()
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		return err
+	}
+	return nil
+}
+
+func StartWithoutPTY(exeCmd *exec.Cmd, interactive bool) error {
+	if interactive {
+		exeCmd.Stdin = os.Stdin
+	} else {
+		exeCmd.Stdin, _ = os.Open(os.DevNull)
+	}
+	exeCmd.Stdout = os.Stdout
+	exeCmd.Stderr = os.Stderr
+
+	if err := exeCmd.Start(); err != nil {
+		return fmt.Errorf("start container: %w", err)
+	}
+
+	sigChan := make(chan os.Signal, 32)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+	defer signal.Stop(sigChan)
+	go func() {
+		for sig := range sigChan {
+			exeCmd.Process.Signal(sig)
+		}
+	}()
+
+	err := exeCmd.Wait()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		return err
+	}
+	return nil
 }
 
 func StartDetached(id string, cc ContainerConfig) error {
 	stateDir := image.ContainerPath(id)
 
-	shimLog, err := os.Create(filepath.Join(stateDir, "shim.log"))
+	shimLog, err := os.OpenFile(filepath.Join(stateDir, "shim.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return err
 	}
@@ -242,7 +243,7 @@ func StartDetached(id string, cc ContainerConfig) error {
 	if err := shimCmd.Start(); err != nil {
 		return err
 	}
-	shimCmd.Process.Release() // reparent to init
+	shimCmd.Process.Release() // reparent to PID 1 (init)
 
 	fmt.Println(id)
 	return nil
@@ -250,10 +251,9 @@ func StartDetached(id string, cc ContainerConfig) error {
 
 func RunShim(id string) error {
 	stateDir := image.ContainerPath(id)
-
 	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
 	if err != nil {
-		return fmt.Errorf("shim config: %w", err)
+		return fmt.Errorf("failed to read config: %w", err)
 	}
 	var cc ContainerConfig
 	if err := json.Unmarshal(configBytes, &cc); err != nil {
@@ -262,7 +262,6 @@ func RunShim(id string) error {
 
 	outLog, err := os.OpenFile(filepath.Join(stateDir, "output.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-
 	if err != nil {
 		return err
 	}
@@ -297,38 +296,38 @@ func RunShim(id string) error {
 }
 
 func Init(id string) error {
-	configPath := fmt.Sprintf("%v/config.json", image.ContainerPath(id))
-	data, err := os.ReadFile(configPath)
+	stateDir := image.ContainerPath(id)
+	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read config: %w", err)
 	}
-	var cfg ContainerConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	var cc ContainerConfig
+	if err := json.Unmarshal(configBytes, &cc); err != nil {
 		return err
 	}
 
-	if err := ApplyCgroups(cfg.Name, cfg.Limits); err != nil {
+	if err := ApplyCgroups(cc.Name, cc.Limits); err != nil {
 		log.Printf("warning: cgroup apply failed: %v", err)
 	}
 
-	if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
+	if err := syscall.Sethostname([]byte(cc.Hostname)); err != nil {
 		return err
 	}
 
-	procTarget := filepath.Join(cfg.RootDir, "proc")
+	procTarget := filepath.Join(cc.RootDir, "proc")
 	if err := syscall.Mount("proc", procTarget, "proc", 0, ""); err != nil {
 		return err
 	}
 
-	if err := ChangeRoot(cfg.RootDir); err != nil {
+	if err := ChangeRoot(cc.RootDir); err != nil {
 		return err
 	}
 
-	path, err := exec.LookPath(cfg.Cmd[0])
+	path, err := exec.LookPath(cc.Cmd[0])
 	if err != nil {
 		log.Fatalf("command not found: %v", err)
 	}
-	return syscall.Exec(path, cfg.Cmd, append(cfg.Env, "HOSTNAME="+cfg.Hostname))
+	return syscall.Exec(path, cc.Cmd, append(cc.Env, "HOSTNAME="+cc.Hostname))
 }
 
 func ChangeRoot(newRoot string) error {
