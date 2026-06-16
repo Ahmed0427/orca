@@ -2,6 +2,7 @@ package container
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ahmed0427/orca/pkg/image"
 	"github.com/creack/pty"
@@ -44,16 +46,16 @@ type ContainerConfig struct {
 	TTY      bool
 }
 
-const cgroupRoot = "/sys/fs/cgroup"
-const cloneflags = syscall.CLONE_NEWNS |
+const CgroupRoot = "/sys/fs/cgroup"
+const Cloneflags = syscall.CLONE_NEWNS |
 	syscall.CLONE_NEWUTS |
 	syscall.CLONE_NEWPID |
 	syscall.CLONE_NEWNET |
 	syscall.CLONE_NEWIPC
 
 var (
-	sentinelShim = "_shim_"
-	sentinelInit = "_init_"
+	SentinelShim = "_shim_"
+	SentinelInit = "_init_"
 )
 
 func RunImage(tag string, userCmd []string, opts RunOptions) error {
@@ -70,11 +72,11 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 		return err
 	}
 
-	id, err := createContainerDir()
+	id, err := CreateContainerDir()
 	if err != nil {
 		return err
 	}
-	if err := mountOverlay(id, tag, cfg); err != nil {
+	if err := MountOverlay(id, tag, cfg); err != nil {
 		return err
 	}
 
@@ -113,15 +115,15 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 	}
 
 	if opts.Detach {
-		return startDetached(id, cc)
+		return StartDetached(id, cc)
 	}
-	return startAttached(id, cc, opts)
+	return StartAttached(id, cc, opts)
 }
 
-func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
-	exeCmd := exec.Command("/proc/self/exe", sentinelInit, id)
+func StartAttached(id string, cc ContainerConfig, opts RunOptions) error {
+	exeCmd := exec.Command("/proc/self/exe", SentinelInit, id)
 	exeCmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: cloneflags,
+		Cloneflags: Cloneflags,
 	}
 
 	var err error
@@ -222,7 +224,7 @@ func startAttached(id string, cc ContainerConfig, opts RunOptions) error {
 	}
 }
 
-func startDetached(id string, cc ContainerConfig) error {
+func StartDetached(id string, cc ContainerConfig) error {
 	stateDir := image.ContainerPath(id)
 
 	shimLog, err := os.Create(filepath.Join(stateDir, "shim.log"))
@@ -230,7 +232,7 @@ func startDetached(id string, cc ContainerConfig) error {
 		return err
 	}
 
-	shimCmd := exec.Command("/proc/self/exe", sentinelShim, id)
+	shimCmd := exec.Command("/proc/self/exe", SentinelShim, id)
 	shimCmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true,
 	}
@@ -267,9 +269,9 @@ func RunShim(id string) error {
 	defer outLog.Close()
 
 	devNull, _ := os.Open(os.DevNull)
-	exeCmd := exec.Command("/proc/self/exe", sentinelInit, id)
+	exeCmd := exec.Command("/proc/self/exe", SentinelInit, id)
 	exeCmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: cloneflags,
+		Cloneflags: Cloneflags,
 	}
 	exeCmd.Stdin = devNull
 	exeCmd.Stdout = outLog
@@ -305,7 +307,7 @@ func Init(id string) error {
 		return err
 	}
 
-	if err := applyCgroups(cfg.Name, cfg.Limits); err != nil {
+	if err := ApplyCgroups(cfg.Name, cfg.Limits); err != nil {
 		log.Printf("warning: cgroup apply failed: %v", err)
 	}
 
@@ -318,7 +320,7 @@ func Init(id string) error {
 		return err
 	}
 
-	if err := changeRoot(cfg.RootDir); err != nil {
+	if err := ChangeRoot(cfg.RootDir); err != nil {
 		return err
 	}
 
@@ -329,7 +331,7 @@ func Init(id string) error {
 	return syscall.Exec(path, cfg.Cmd, append(cfg.Env, "HOSTNAME="+cfg.Hostname))
 }
 
-func changeRoot(newRoot string) error {
+func ChangeRoot(newRoot string) error {
 	if err := syscall.Chroot(newRoot); err != nil {
 		return fmt.Errorf("chroot failed: %w", err)
 	}
@@ -339,8 +341,8 @@ func changeRoot(newRoot string) error {
 	return nil
 }
 
-func applyCgroups(name string, limits CgroupSpecs) error {
-	parent := filepath.Join(cgroupRoot, "orca")
+func ApplyCgroups(name string, limits CgroupSpecs) error {
+	parent := filepath.Join(CgroupRoot, "orca")
 	leaf := filepath.Join(parent, name)
 
 	os.MkdirAll(parent, 0755)
@@ -352,8 +354,8 @@ func applyCgroups(name string, limits CgroupSpecs) error {
 	write := func(file, val string) {
 		os.WriteFile(filepath.Join(leaf, file), []byte(val), 0644)
 	}
-	write("memory.max", ifEmpty(limits.MemoryMax, "max"))
-	write("pids.max", ifEmpty(limits.PidsMax, "max"))
+	write("memory.max", IfEmpty(limits.MemoryMax, "max"))
+	write("pids.max", IfEmpty(limits.PidsMax, "max"))
 	if limits.CPUMax != "" {
 		write("cpu.max", limits.CPUMax)
 	}
@@ -361,8 +363,8 @@ func applyCgroups(name string, limits CgroupSpecs) error {
 		[]byte(strconv.Itoa(os.Getpid())), 0644)
 }
 
-func createContainerDir() (string, error) {
-	id := genHexID()
+func CreateContainerDir() (string, error) {
+	id := GenHexID()
 	path := image.ContainerPath(id)
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return "", err
@@ -370,7 +372,7 @@ func createContainerDir() (string, error) {
 	return id, nil
 }
 
-func mountOverlay(id, tag string, cfg *image.ConfigBlob) error {
+func MountOverlay(id, tag string, cfg *image.ConfigBlob) error {
 	var lowers []string
 	for _, diffID := range cfg.Rootfs.DiffIds {
 		layerID := image.LayerID(diffID)
@@ -391,15 +393,17 @@ func mountOverlay(id, tag string, cfg *image.ConfigBlob) error {
 	return unix.Mount("overlay", root, "overlay", 0, opts)
 }
 
-func genHexID() string {
-	b := make([]byte, 6)
-	if _, err := rand.Read(b); err != nil {
-		panic("crypto rand failed")
+func GenHexID() string {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint32(b[0:4], uint32(time.Now().Unix()))
+	_, err := rand.Read(b[4:8])
+	if err != nil {
+		panic(err)
 	}
 	return hex.EncodeToString(b)
 }
 
-func ifEmpty(s, def string) string {
+func IfEmpty(s, def string) string {
 	if s == "" {
 		return def
 	}

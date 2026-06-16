@@ -73,8 +73,8 @@ func runCommand(args []string) {
 		flags.PrintDefaults()
 	}
 
-	interactive := flags.Bool("i", false, "Keep stdin open even when not attached")
-	tty := flags.Bool("t", false, "Allocate a pseudo-TTY")
+	interactive := flags.Bool("i", true, "Keep stdin open even when not attached")
+	tty := flags.Bool("t", true, "Allocate a pseudo-TTY")
 	detach := flags.Bool("d", false, "Run container in background and print container ID")
 	name := flags.String("name", "", "Assign a name to the container")
 	hostname := flags.String("hostname", "", "Container host name")
@@ -84,16 +84,16 @@ func runCommand(args []string) {
 
 	flags.Parse(args)
 
-	// After parsing, remaining arguments: image and optional command
 	if flags.NArg() < 1 {
 		fmt.Fprintf(os.Stderr, "Error: image name required.\n\n")
 		flags.Usage()
 		os.Exit(1)
 	}
 
-	// -d implies no -i (user can still specify but we clamp it)
+	// -d implies no -i and no -t (user can still specify but we clamp it)
 	if *detach {
 		*interactive = false
+		*tty = false
 	}
 
 	registry, namespace, repo, tag := image.ParseImageTarget(flags.Arg(0))
@@ -178,7 +178,6 @@ func verifyCommand(args []string) {
 }
 
 func imagesCommand(args []string) {
-	// No flags expected
 	if len(args) != 0 && args[0] == "--help" {
 		fmt.Fprintf(os.Stderr, "Usage: %s images\n", os.Args[0])
 		return
