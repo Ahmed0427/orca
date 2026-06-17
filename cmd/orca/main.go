@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ahmed0427/orca/pkg/container"
 	"github.com/ahmed0427/orca/pkg/image"
@@ -195,7 +198,12 @@ func imagesCommand(args []string) {
 	if err != nil {
 		log.Fatalf("failed to list images: %v\n", err)
 	}
-	fmt.Printf("%-45s %-10s\n", "IMAGE", "DISK USAGE")
+	if len(images) == 0 {
+		fmt.Println("No images found.")
+		return
+	}
+
+	fmt.Printf("%-35s %-10s\n", "IMAGE", "DISK USAGE")
 	for _, ref := range images {
 		size, err := image.ImageSize(ref)
 		if err != nil || size == 0 {
@@ -208,16 +216,79 @@ func imagesCommand(args []string) {
 
 func containersCommand(args []string) {
 	if len(args) != 0 && args[0] == "--help" {
-		fmt.Fprintf(os.Stderr, "Usage: %s images\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s containers\n", os.Args[0])
 		return
 	}
 	containers, err := container.ListContainers()
 	if err != nil {
-		log.Fatalf("failed to list list containers: %v\n", err)
+		log.Fatalf("failed to list containers: %v\n", err)
 	}
+	if len(containers) == 0 {
+		fmt.Println("No containers found.")
+		return
+	}
+
+	fmt.Printf("%-15s %-35s %-15s %-12s %s\n",
+		"CONTAINER ID", "IMAGE", "COMMAND", "STATUS", "CREATED")
+
 	for _, id := range containers {
-		fmt.Println(id)
+		path := image.ContainerPath(id)
+		info, err := os.Stat(path)
+		if err != nil {
+			log.Printf("skipping container %s: %v", id, err)
+			continue
+		}
+
+		imageNameBytes, err := os.ReadFile(filepath.Join(path, "image"))
+		if err != nil {
+			log.Printf("skipping container %s: failed to read image name: %v", id, err)
+			continue
+		}
+		imageName := strings.TrimSpace(string(imageNameBytes))
+
+		commandStr := readContainerCommand(path)
+
+		status := "Up"
+		if image.PathExists(filepath.Join(path, "exit-code")) {
+			exitCodeBytes, err := os.ReadFile(filepath.Join(path, "exit-code"))
+			if err == nil {
+				status = fmt.Sprintf("Exited (%s)", strings.TrimSpace(string(exitCodeBytes)))
+			} else {
+				status = "Exited"
+			}
+		}
+
+		createdAgo := time.Since(info.ModTime()).Truncate(time.Second).String() + " ago"
+
+		shortID := id
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+
+		fmt.Printf("%-15s %-35s %-15s %-12s %s\n",
+			shortID, imageName, commandStr, status, createdAgo)
 	}
+}
+
+func readContainerCommand(containerPath string) string {
+	configBytes, err := os.ReadFile(filepath.Join(containerPath, "config.json"))
+	if err != nil {
+		log.Printf("warning: could not read config.json for container %s: %v", containerPath, err)
+		return "?"
+	}
+	var cc container.ContainerConfig
+	if err := json.Unmarshal(configBytes, &cc); err != nil {
+		log.Printf("warning: malformed config.json for container %s: %v", containerPath, err)
+		return "?"
+	}
+	if len(cc.Cmd) == 0 {
+		return "(no command)"
+	}
+	cmd := strings.Join(cc.Cmd, " ")
+	if len(cmd) > 12 {
+		cmd = cmd[:12] + "…"
+	}
+	return cmd
 }
 
 func gcCommand(args []string) {

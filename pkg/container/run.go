@@ -114,6 +114,11 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 		return err
 	}
 
+	imageNamePath := filepath.Join(containerPath, "image")
+	if err := os.WriteFile(imageNamePath, []byte(tag), 0600); err != nil {
+		return err
+	}
+
 	if opts.Detach {
 		return StartDetached(id, cc)
 	}
@@ -126,12 +131,12 @@ func StartAttached(id string, cc ContainerConfig, opts RunOptions) error {
 		Cloneflags: Cloneflags,
 	}
 	if !opts.Interactive || !opts.TTY {
-		return StartWithoutPTY(exeCmd, opts.Interactive)
+		return StartWithoutPTY(exeCmd, id, opts.Interactive)
 	}
-	return StartWithPTY(exeCmd)
+	return StartWithPTY(exeCmd, id)
 }
 
-func StartWithPTY(exeCmd *exec.Cmd) error {
+func StartWithPTY(exeCmd *exec.Cmd, id string) error {
 	ptm, pts, err := pty.Open()
 	if err != nil {
 		return fmt.Errorf("pty open: %w", err)
@@ -183,16 +188,20 @@ func StartWithPTY(exeCmd *exec.Cmd) error {
 	ptm.Close()
 	pts.Close()
 
+	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
 		}
-		return err
 	}
-	return nil
+	stateDir := image.ContainerPath(id)
+	return os.WriteFile(filepath.Join(stateDir, "exit-code"),
+		[]byte(strconv.Itoa(exitCode)), 0644)
 }
 
-func StartWithoutPTY(exeCmd *exec.Cmd, interactive bool) error {
+func StartWithoutPTY(exeCmd *exec.Cmd, id string, interactive bool) error {
 	if interactive {
 		exeCmd.Stdin = os.Stdin
 	} else {
@@ -215,13 +224,17 @@ func StartWithoutPTY(exeCmd *exec.Cmd, interactive bool) error {
 	}()
 
 	err := exeCmd.Wait()
+	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
 		}
-		return err
 	}
-	return nil
+	stateDir := image.ContainerPath(id)
+	return os.WriteFile(filepath.Join(stateDir, "exit-code"),
+		[]byte(strconv.Itoa(exitCode)), 0644)
 }
 
 func StartDetached(id string, cc ContainerConfig) error {
@@ -297,6 +310,7 @@ func RunShim(id string) error {
 
 func Init(id string) error {
 	stateDir := image.ContainerPath(id)
+
 	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
@@ -393,9 +407,9 @@ func MountOverlay(id, tag string, cfg *image.ConfigBlob) error {
 }
 
 func GenHexID() string {
-	b := make([]byte, 8)
+	b := make([]byte, 6)
 	binary.BigEndian.PutUint32(b[0:4], uint32(time.Now().Unix()))
-	_, err := rand.Read(b[4:8])
+	_, err := rand.Read(b[4:6])
 	if err != nil {
 		panic(err)
 	}
