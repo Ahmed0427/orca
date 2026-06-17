@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -54,6 +55,8 @@ func main() {
 		verifyCommand(os.Args[2:])
 	case "images":
 		imagesCommand(os.Args[2:])
+	case "containers":
+		containersCommand(os.Args[2:])
 	case "gc":
 		gcCommand(os.Args[2:])
 	case "help", "--help", "-h":
@@ -144,10 +147,16 @@ func rmCommand(args []string) {
 		flags.Usage()
 		os.Exit(1)
 	}
-	registry, namespace, repo, tag := image.ParseImageTarget(flags.Arg(0))
-	fullRef := image.FullRef(registry, namespace, repo, tag)
-	if err := image.RemoveImage(fullRef); err != nil {
-		log.Fatalf("remove failed: %v", err)
+	if !isValidHex(flags.Arg(0)) {
+		registry, namespace, repo, tag := image.ParseImageTarget(flags.Arg(0))
+		fullRef := image.FullRef(registry, namespace, repo, tag)
+		if err := image.RemoveImage(fullRef); err != nil {
+			log.Fatalf("remove image failed: %v", err)
+		}
+	} else {
+		if err := container.RemoveContainer(flags.Arg(0)); err != nil {
+			log.Fatalf("remove conatiner failed: %v", err)
+		}
 	}
 }
 
@@ -197,6 +206,20 @@ func imagesCommand(args []string) {
 	}
 }
 
+func containersCommand(args []string) {
+	if len(args) != 0 && args[0] == "--help" {
+		fmt.Fprintf(os.Stderr, "Usage: %s images\n", os.Args[0])
+		return
+	}
+	containers, err := container.ListContainers()
+	if err != nil {
+		log.Fatalf("failed to list list containers: %v\n", err)
+	}
+	for _, id := range containers {
+		fmt.Println(id)
+	}
+}
+
 func gcCommand(args []string) {
 	if len(args) != 0 && args[0] == "--help" {
 		fmt.Fprintf(os.Stderr, "Usage: %s gc\n", os.Args[0])
@@ -230,4 +253,9 @@ func HumanSize(size int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
+}
+
+func isValidHex(s string) bool {
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
