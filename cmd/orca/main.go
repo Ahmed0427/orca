@@ -150,16 +150,33 @@ func rmCommand(args []string) {
 		flags.Usage()
 		os.Exit(1)
 	}
+
+	if flags.Arg(0) == "all" {
+		containers, err := container.ListContainers()
+		if err != nil {
+			log.Fatalf("failed to remove all containers: %v\n", err)
+		}
+		for _, id := range containers {
+			if err := container.RemoveContainer(id); err != nil {
+				log.Fatalf("remove conatiner failed: %v", err)
+			}
+		}
+		fmt.Println("all containers are removed")
+		return
+	}
+
 	if !isValidHex(flags.Arg(0)) {
 		registry, namespace, repo, tag := image.ParseImageTarget(flags.Arg(0))
 		fullRef := image.FullRef(registry, namespace, repo, tag)
 		if err := image.RemoveImage(fullRef); err != nil {
 			log.Fatalf("remove image failed: %v", err)
 		}
+		fmt.Printf("image %s is removed\n", flags.Arg(0))
 	} else {
 		if err := container.RemoveContainer(flags.Arg(0)); err != nil {
 			log.Fatalf("remove conatiner failed: %v", err)
 		}
+		fmt.Printf("conatiner with ID %s is removed\n", flags.Arg(0))
 	}
 }
 
@@ -304,12 +321,13 @@ func gcCommand(args []string) {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "Usage: orca <command> [args...]\n\n")
 	fmt.Fprintf(os.Stderr, "Commands:\n")
-	fmt.Fprintf(os.Stderr, "  run     Run a command in a new container\n")
-	fmt.Fprintf(os.Stderr, "  pull    Pull an image from a registry\n")
-	fmt.Fprintf(os.Stderr, "  rm      Remove an image tag\n")
-	fmt.Fprintf(os.Stderr, "  verify  Verify structural integrity of an image\n")
-	fmt.Fprintf(os.Stderr, "  images  List downloaded image tags\n")
-	fmt.Fprintf(os.Stderr, "  gc      Run garbage collection on unused blobs/layers\n")
+	fmt.Fprintf(os.Stderr, "  run        Run a command in a new container\n")
+	fmt.Fprintf(os.Stderr, "  pull       Pull an image from a registry\n")
+	fmt.Fprintf(os.Stderr, "  rm         Remove an image tag or container\n")
+	fmt.Fprintf(os.Stderr, "  verify     Verify structural integrity of an image\n")
+	fmt.Fprintf(os.Stderr, "  images     List downloaded image tags\n")
+	fmt.Fprintf(os.Stderr, "  containers List containers\n")
+	fmt.Fprintf(os.Stderr, "  gc         Run garbage collection on unused blobs/layers\n")
 	fmt.Fprintf(os.Stderr, "\nRun 'orca <command> --help' for more information on a command.\n")
 }
 

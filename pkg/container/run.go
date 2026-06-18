@@ -47,16 +47,30 @@ type ContainerConfig struct {
 }
 
 const CgroupRoot = "/sys/fs/cgroup"
-const Cloneflags = syscall.CLONE_NEWNS |
-	syscall.CLONE_NEWUTS |
-	syscall.CLONE_NEWPID |
-	syscall.CLONE_NEWNET |
-	syscall.CLONE_NEWIPC
 
 var (
 	SentinelShim = "_shim_"
 	SentinelInit = "_init_"
 )
+
+func NewIsolatedCmd(id string) *exec.Cmd {
+	const cloneFlags = syscall.CLONE_NEWNS |
+		syscall.CLONE_NEWUTS |
+		syscall.CLONE_NEWPID |
+		syscall.CLONE_NEWIPC
+
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("failed to get executable path: %v", err)
+	}
+
+	cmd := exec.Command("ip", "netns", "exec", id[len(id)-8:], exe, SentinelInit, id)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: cloneFlags,
+	}
+
+	return cmd
+}
 
 func RunImage(tag string, userCmd []string, opts RunOptions) error {
 	if opts.Detach && opts.Interactive {
@@ -119,6 +133,8 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 		return err
 	}
 
+	CreateContainer(id)
+
 	if opts.Detach {
 		return StartDetached(id, cc)
 	}
@@ -126,17 +142,14 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 }
 
 func StartAttached(id string, cc ContainerConfig, opts RunOptions) error {
-	exeCmd := exec.Command("/proc/self/exe", SentinelInit, id)
-	exeCmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: Cloneflags,
-	}
+	exeCmd := NewIsolatedCmd(id)
 	if !opts.Interactive || !opts.TTY {
-		return StartWithoutPTY(exeCmd, id, opts.Interactive)
+		return StartWithoutPTY(exeCmd, id, cc, opts.Interactive)
 	}
-	return StartWithPTY(exeCmd, id)
+	return StartWithPTY(exeCmd, id, cc)
 }
 
-func StartWithPTY(exeCmd *exec.Cmd, id string) error {
+func StartWithPTY(exeCmd *exec.Cmd, id string, cc ContainerConfig) error {
 	ptm, pts, err := pty.Open()
 	if err != nil {
 		return fmt.Errorf("pty open: %w", err)
@@ -156,12 +169,10 @@ func StartWithPTY(exeCmd *exec.Cmd, id string) error {
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	// propagate initial window size
 	if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
 		pty.Setsize(ptm, ws)
 	}
 
-	// listen for SIGWINCH and update pty size
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
 	defer signal.Stop(sigCh)
@@ -182,9 +193,13 @@ func StartWithPTY(exeCmd *exec.Cmd, id string) error {
 		return fmt.Errorf("start container: %w", err)
 	}
 
+	// Apply cgroups from host using the child's host PID
+	if err := SetupCgroups(cc.Name, cc.Limits, exeCmd.Process.Pid); err != nil {
+		log.Printf("warning: cgroup apply failed: %v", err)
+	}
+
 	err = exeCmd.Wait()
 
-	// closing the master causes the io.Copy goroutines to see EOF/error
 	ptm.Close()
 	pts.Close()
 
@@ -201,7 +216,7 @@ func StartWithPTY(exeCmd *exec.Cmd, id string) error {
 		[]byte(strconv.Itoa(exitCode)), 0644)
 }
 
-func StartWithoutPTY(exeCmd *exec.Cmd, id string, interactive bool) error {
+func StartWithoutPTY(exeCmd *exec.Cmd, id string, cc ContainerConfig, interactive bool) error {
 	if interactive {
 		exeCmd.Stdin = os.Stdin
 	} else {
@@ -212,6 +227,11 @@ func StartWithoutPTY(exeCmd *exec.Cmd, id string, interactive bool) error {
 
 	if err := exeCmd.Start(); err != nil {
 		return fmt.Errorf("start container: %w", err)
+	}
+
+	// Apply cgroups from host using the child's host PID
+	if err := SetupCgroups(cc.Name, cc.Limits, exeCmd.Process.Pid); err != nil {
+		log.Printf("warning: cgroup apply failed: %v", err)
 	}
 
 	sigChan := make(chan os.Signal, 32)
@@ -256,7 +276,7 @@ func StartDetached(id string, cc ContainerConfig) error {
 	if err := shimCmd.Start(); err != nil {
 		return err
 	}
-	shimCmd.Process.Release() // reparent to PID 1 (init)
+	shimCmd.Process.Release()
 
 	fmt.Println(id)
 	return nil
@@ -281,10 +301,7 @@ func RunShim(id string) error {
 	defer outLog.Close()
 
 	devNull, _ := os.Open(os.DevNull)
-	exeCmd := exec.Command("/proc/self/exe", SentinelInit, id)
-	exeCmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: Cloneflags,
-	}
+	exeCmd := NewIsolatedCmd(id)
 	exeCmd.Stdin = devNull
 	exeCmd.Stdout = outLog
 	exeCmd.Stderr = outLog
@@ -292,8 +309,11 @@ func RunShim(id string) error {
 	if err := exeCmd.Start(); err != nil {
 		return err
 	}
-	pidPath := filepath.Join(stateDir, "container.pid")
-	os.WriteFile(pidPath, []byte(strconv.Itoa(exeCmd.Process.Pid)), 0644)
+
+	// Apply cgroups from host inside the shim process using the child's host PID
+	if err := SetupCgroups(cc.Name, cc.Limits, exeCmd.Process.Pid); err != nil {
+		log.Printf("warning: cgroup apply failed: %v", err)
+	}
 
 	err = exeCmd.Wait()
 	exitCode := 0
@@ -311,35 +331,44 @@ func RunShim(id string) error {
 func Init(id string) error {
 	stateDir := image.ContainerPath(id)
 
+	pidPath := filepath.Join(stateDir, "container.pid")
+	os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0644)
+
 	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
 	var cc ContainerConfig
 	if err := json.Unmarshal(configBytes, &cc); err != nil {
-		return err
-	}
-
-	if err := ApplyCgroups(cc.Name, cc.Limits); err != nil {
-		log.Printf("warning: cgroup apply failed: %v", err)
+		return fmt.Errorf("failed to unmarshal config bytes: %w", err)
 	}
 
 	if err := syscall.Sethostname([]byte(cc.Hostname)); err != nil {
-		return err
-	}
-
-	procTarget := filepath.Join(cc.RootDir, "proc")
-	if err := syscall.Mount("proc", procTarget, "proc", 0, ""); err != nil {
-		return err
+		return fmt.Errorf("failed to set hostname: %w", err)
 	}
 
 	if err := ChangeRoot(cc.RootDir); err != nil {
-		return err
+		return fmt.Errorf("failed to change root: %w", err)
+	}
+
+	if err := os.MkdirAll("/proc", 0755); err != nil {
+		return fmt.Errorf("failed to create /proc inside container: %w", err)
+	}
+
+	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+		return fmt.Errorf("failed to mount procfs: %w", err)
 	}
 
 	path, err := exec.LookPath(cc.Cmd[0])
 	if err != nil {
-		log.Fatalf("command not found: %v", err)
+		for _, dir := range []string{"/bin", "/usr/bin", "/sbin"} {
+			absPath := filepath.Join(dir, cc.Cmd[0])
+			if _, statErr := os.Stat(absPath); statErr == nil {
+				path = absPath
+				err = nil
+				break
+			}
+		}
 	}
 	return syscall.Exec(path, cc.Cmd, append(cc.Env, "HOSTNAME="+cc.Hostname))
 }
@@ -354,26 +383,39 @@ func ChangeRoot(newRoot string) error {
 	return nil
 }
 
-func ApplyCgroups(name string, limits CgroupSpecs) error {
+func SetupCgroups(name string, limits CgroupSpecs, pid int) error {
 	parent := filepath.Join(CgroupRoot, "orca")
 	leaf := filepath.Join(parent, name)
 
-	os.MkdirAll(parent, 0755)
-	os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"),
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return fmt.Errorf("mkdir parent failed: %w", err)
+	}
+
+	_ = os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"),
 		[]byte("+cpu +memory +pids"), 0644)
 
-	os.Mkdir(leaf, 0755)
+	if err := os.MkdirAll(leaf, 0755); err != nil {
+		return fmt.Errorf("mkdir leaf failed: %w", err)
+	}
 
-	write := func(file, val string) {
-		os.WriteFile(filepath.Join(leaf, file), []byte(val), 0644)
+	write := func(file, val string) error {
+		return os.WriteFile(filepath.Join(leaf, file), []byte(val), 0644)
 	}
-	write("memory.max", IfEmpty(limits.MemoryMax, "max"))
-	write("pids.max", IfEmpty(limits.PidsMax, "max"))
+
+	if err := write("memory.max", IfEmpty(limits.MemoryMax, "max")); err != nil {
+		return fmt.Errorf("failed to write memory.max: %w", err)
+	}
+	if err := write("pids.max", IfEmpty(limits.PidsMax, "max")); err != nil {
+		return fmt.Errorf("failed to write pids.max: %w", err)
+	}
 	if limits.CPUMax != "" {
-		write("cpu.max", limits.CPUMax)
+		if err := write("cpu.max", limits.CPUMax); err != nil {
+			return fmt.Errorf("failed to write cpu.max: %w", err)
+		}
 	}
+
 	return os.WriteFile(filepath.Join(leaf, "cgroup.procs"),
-		[]byte(strconv.Itoa(os.Getpid())), 0644)
+		[]byte(strconv.Itoa(pid)), 0644)
 }
 
 func CreateContainerDir() (string, error) {

@@ -1,7 +1,9 @@
 package container
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,7 +31,9 @@ func RemoveContainer(id string) error {
 
 	procTarget := filepath.Join(rootDir, "proc")
 	if err := syscall.Unmount(procTarget, syscall.MNT_DETACH); err != nil {
-		return fmt.Errorf("failed to unmount procfs: %v", err)
+		if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.EINVAL) {
+			return fmt.Errorf("failed to unmount procfs: %v", err)
+		}
 	}
 
 	if err := syscall.Unmount(rootDir, syscall.MNT_DETACH); err != nil {
@@ -43,6 +47,8 @@ func RemoveContainer(id string) error {
 	if err := os.RemoveAll(containerPath); err != nil {
 		return fmt.Errorf("failed to remove container directory: %w", err)
 	}
+
+	CleanupContainer(id)
 
 	return nil
 }
