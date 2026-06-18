@@ -359,6 +359,11 @@ func Init(id string) error {
 		return fmt.Errorf("failed to mount procfs: %w", err)
 	}
 
+	hostResolv := "/etc/resolv.conf"
+	if err := os.WriteFile(hostResolv, []byte("nameserver 1.1.1.1"), 0644); err != nil {
+		return fmt.Errorf("failed to write container resolv.conf: %v", err)
+	}
+
 	path, err := exec.LookPath(cc.Cmd[0])
 	if err != nil {
 		for _, dir := range []string{"/bin", "/usr/bin", "/sbin"} {
