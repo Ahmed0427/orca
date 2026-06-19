@@ -1,2 +1,2 @@
 build:
-	go build cmd/orca/main.go
+	go build -o orca ./cmd/orca
