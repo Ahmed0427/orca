@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	BridgeName    = "mini0"
+	BridgeName    = "orca0"
 	IPForwardFile = "/proc/sys/net/ipv4/ip_forward"
 	BridgeIP      = "10.200.0.1/16"
 	SubnetCIDR    = "10.200.0.0/16"
@@ -124,7 +124,7 @@ func CleanupContainer(id string) {
 	_ = RunCmdSilent("ip", "netns", "del", name)
 }
 
-func CleanupAll() {
+func CleanupNet() {
 	entries, _ := os.ReadDir("/var/run/netns")
 	for _, e := range entries {
 		ns := e.Name()

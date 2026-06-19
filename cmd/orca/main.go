@@ -161,6 +161,7 @@ func rmCommand(args []string) {
 				log.Fatalf("remove conatiner failed: %v", err)
 			}
 		}
+		container.CleanupNet()
 		fmt.Println("all containers are removed")
 		return
 	}
