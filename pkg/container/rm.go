@@ -18,6 +18,8 @@ func RemoveContainer(id string) error {
 	containerPath := image.ContainerPath(id)
 	rootDir := filepath.Join(containerPath, "root")
 	cgroupPath := filepath.Join(CgroupRoot, "orca", id)
+	parentCgroupProcs := filepath.Join(CgroupRoot, "orca", "cgroup.procs")
+
 	pidBytes, err := os.ReadFile(filepath.Join(containerPath, "container.pid"))
 	if err == nil {
 		pid, _ := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
@@ -25,7 +27,7 @@ func RemoveContainer(id string) error {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 			EnsureTerminated(pid)
 		} else {
-			panic("conatiner dir corrupted")
+			panic("container dir corrupted")
 		}
 	}
 
@@ -37,11 +39,35 @@ func RemoveContainer(id string) error {
 	}
 
 	if err := syscall.Unmount(rootDir, syscall.MNT_DETACH); err != nil {
-		return fmt.Errorf("failed to unmount overlay root: %v", err)
+		if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.EINVAL) {
+			return fmt.Errorf("failed to unmount overlay root: %v", err)
+		}
 	}
 
-	if err := os.RemoveAll(cgroupPath); err != nil {
-		return fmt.Errorf("failed to remove cgroup dir: %v", err)
+	var cgroupRemoveErr error
+	for i := 0; i < 15; i++ {
+		data, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs"))
+		if err == nil {
+			pids := strings.Fields(string(data))
+			for _, pidStr := range pids {
+				if pid, err := strconv.Atoi(pidStr); err == nil {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+
+					_ = os.WriteFile(parentCgroupProcs, []byte(pidStr), 0644)
+				}
+			}
+		}
+
+		cgroupRemoveErr = os.Remove(cgroupPath)
+		if cgroupRemoveErr == nil {
+			break
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if cgroupRemoveErr != nil {
+		return fmt.Errorf("failed to remove cgroup dir: %v", cgroupRemoveErr)
 	}
 
 	if err := os.RemoveAll(containerPath); err != nil {
@@ -54,10 +80,10 @@ func RemoveContainer(id string) error {
 }
 
 func EnsureTerminated(pid int) {
-	for i := 0; i < 10; i++ { // try for up to 5 seconds
+	for i := 0; i < 25; i++ {
 		err := syscall.Kill(pid, 0)
 		if err == syscall.ESRCH {
-			return // ESRCH means process is officially gone
+			return // ESRCH means the process is completely dead and gone
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
