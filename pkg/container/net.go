@@ -32,7 +32,9 @@ func RunCmdSilent(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func CreateContainer(id string) {
+func CreateContainer(cc ContainerConfig) {
+	id := cc.Name
+
 	EnsureBridge()
 
 	name := id[len(id)-8:]
@@ -48,6 +50,9 @@ func CreateContainer(id string) {
 	RunCmd("ip", "link", "set", hostVeth, "up")
 
 	ip := AllocateIP()
+
+	// strip CIDR mask before generating port maps
+	SetupPortMapping(strings.Split(ip, "/")[0], cc.PortMap)
 
 	RunCmd("ip", "netns", "exec", name,
 		"ip", "addr", "add", ip, "dev", "eth0")
@@ -77,29 +82,74 @@ func EnsureBridge() {
 		log.Printf("Warning: could not enable ip_forward: %v", err)
 	}
 
+	_ = RunCmdSilent("sysctl", "-w", "net.ipv4.conf.all.route_localnet=1")
+	_ = RunCmdSilent("sysctl", "-w", "net.ipv4.conf."+BridgeName+".route_localnet=1")
+	_ = RunCmdSilent("iptables", "-t", "nat", "-N", "ORCA-DNAT")
+
+	AddRuleIfMissing("nat", "PREROUTING",
+		"-m", "addrtype",
+		"--dst-type", "LOCAL",
+		"-j", "ORCA-DNAT",
+	)
+	AddRuleIfMissing("nat", "OUTPUT",
+		"-m", "addrtype",
+		"--dst-type", "LOCAL",
+		"-j", "ORCA-DNAT",
+	)
+
 	SetupForwardRules()
 	SetupMasquerade()
 }
 
 func SetupForwardRules() {
 	b := BridgeName
-	// forward traffic within the bridge (container <-> container)
 	AddRuleIfMissing("filter", "FORWARD", "-i", b, "-o", b, "-j", "ACCEPT")
-	// forward traffic from bridge to outside
 	AddRuleIfMissing("filter", "FORWARD", "-i", b, "!", "-o", b, "-j", "ACCEPT")
-	// allow return traffic
 	AddRuleIfMissing("filter", "FORWARD", "-o", b, "-j", "ACCEPT")
 }
 
 func SetupMasquerade() {
+	// container traffic going outbound
 	AddRuleIfMissing("nat", "POSTROUTING",
 		"-s", SubnetCIDR, "!", "-o", BridgeName, "-j", "MASQUERADE")
+
+	// masquerade traffic originating from host localhost to the container
+	AddRuleIfMissing("nat", "POSTROUTING",
+		"-o", BridgeName, "-m", "addrtype", "--src-type", "LOCAL", "-j", "MASQUERADE")
+}
+
+func SetupPortMapping(containerIP, portMap string) {
+	if portMap == "" {
+		return
+	}
+
+	ports := strings.Split(portMap, ":")
+	if len(ports) != 2 {
+		panic("port mapping must provide two ports in form 'hostPort:ContainerPort'")
+	}
+
+	hostPort, containerPort := ports[0], ports[1]
+	target := containerIP + ":" + containerPort
+	portChain := fmt.Sprintf("ORCA-P-%s", hostPort)
+
+	_ = RunCmdSilent("iptables", "-t", "nat", "-N", portChain)
+	_ = RunCmdSilent("iptables", "-t", "nat", "-F", portChain)
+
+	AddRuleIfMissing("nat", "ORCA-DNAT", "-p", "tcp", "--dport", hostPort, "-j", portChain)
+
+	RunCmd("iptables",
+		"-t", "nat",
+		"-A", portChain,
+		"-p", "tcp",
+		"-j", "DNAT",
+		"--to-destination", target,
+	)
 }
 
 func AddRuleIfMissing(table, chain string, rule ...string) {
 	args := append([]string{"-t", table, "-C", chain}, rule...)
 	if err := RunCmdSilent("iptables", args...); err == nil {
-		return // rule exists
+		return
 	}
 	args = append([]string{"-t", table, "-A", chain}, rule...)
 	RunCmd("iptables", args...)
@@ -107,13 +157,10 @@ func AddRuleIfMissing(table, chain string, rule ...string) {
 
 func AllocateIP() string {
 	entries, _ := os.ReadDir("/var/run/netns")
-
 	lastOctet := StartIP + len(entries)
-
 	if lastOctet > 254 {
 		log.Fatalf("Subnet exhausted! Too many containers.")
 	}
-
 	return fmt.Sprintf("10.200.0.%d/16", lastOctet)
 }
 
@@ -138,14 +185,43 @@ func CleanupNet() {
 
 	b := BridgeName
 
-	_ = RunCmdSilent("ip", "link", "del", b)
+	_ = RunCmdSilent("iptables",
+		"-t", "nat",
+		"-D", "PREROUTING",
+		"-m", "addrtype",
+		"--dst-type", "LOCAL",
+		"-j", "ORCA-DNAT",
+	)
 
-	_ = RunCmdSilent("iptables", "-t", "nat", "-D", "POSTROUTING",
-		"-s", SubnetCIDR, "!", "-o", b, "-j", "MASQUERADE")
+	_ = RunCmdSilent("iptables",
+		"-t", "nat",
+		"-D", "OUTPUT",
+		"-m", "addrtype",
+		"--dst-type", "LOCAL",
+		"-j", "ORCA-DNAT",
+	)
+	_ = RunCmdSilent("iptables", "-t", "nat", "-F", "ORCA-DNAT")
+	_ = RunCmdSilent("iptables", "-t", "nat", "-X", "ORCA-DNAT")
+
+	_ = RunCmdSilent("iptables",
+		"-t", "nat",
+		"-D", "POSTROUTING", "-s", SubnetCIDR,
+		"!", "-o", b,
+		"-j", "MASQUERADE",
+	)
+
+	_ = RunCmdSilent("iptables",
+		"-t", "nat",
+		"-D", "POSTROUTING",
+		"-o", b,
+		"-m", "addrtype",
+		"--src-type", "LOCAL",
+		"-j", "MASQUERADE",
+	)
 
 	_ = RunCmdSilent("iptables", "-D", "FORWARD", "-i", b, "-o", b, "-j", "ACCEPT")
-
 	_ = RunCmdSilent("iptables", "-D", "FORWARD", "-i", b, "!", "-o", b, "-j", "ACCEPT")
-
 	_ = RunCmdSilent("iptables", "-D", "FORWARD", "-o", b, "-j", "ACCEPT")
+
+	_ = RunCmdSilent("ip", "link", "del", b)
 }

@@ -82,6 +82,7 @@ func runCommand(args []string) {
 	interactive := flags.Bool("i", true, "Keep stdin open even when not attached")
 	tty := flags.Bool("t", true, "Allocate a pseudo-TTY")
 	detach := flags.Bool("d", false, "Run container in background and print container ID")
+	portMap := flags.String("p", "", "port mapping")
 	name := flags.String("name", "", "Assign a name to the container")
 	hostname := flags.String("hostname", "", "Container host name")
 	memory := flags.String("memory", "", "Memory limit (e.g. 256m)")
@@ -111,6 +112,7 @@ func runCommand(args []string) {
 		Detach:      *detach,
 		Name:        *name,
 		Hostname:    *hostname,
+		PortMap:     *portMap,
 		Limits: container.CgroupSpecs{
 			MemoryMax: *memory,
 			CPUMax:    *cpu,

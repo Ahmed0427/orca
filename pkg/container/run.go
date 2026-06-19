@@ -33,12 +33,14 @@ type RunOptions struct {
 	Detach      bool
 	Name        string
 	Hostname    string
+	PortMap     string
 	Limits      CgroupSpecs
 }
 
 type ContainerConfig struct {
 	Name     string
 	Hostname string
+	PortMap  string
 	Cmd      []string
 	Env      []string
 	RootDir  string
@@ -118,6 +120,7 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 		Cmd:      cmd,
 		Env:      env,
 		RootDir:  rootDir,
+		PortMap:  opts.PortMap,
 		Limits:   opts.Limits,
 		TTY:      opts.TTY,
 	}
@@ -133,7 +136,7 @@ func RunImage(tag string, userCmd []string, opts RunOptions) error {
 		return err
 	}
 
-	CreateContainer(id)
+	CreateContainer(cc)
 
 	if opts.Detach {
 		return StartDetached(id, cc)
