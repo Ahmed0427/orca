@@ -71,10 +71,6 @@ func RemoveContainer(id string) error {
 		return fmt.Errorf("failed to remove cgroup dir: %v", cgroupRemoveErr)
 	}
 
-	if err := os.RemoveAll(containerPath); err != nil {
-		return fmt.Errorf("failed to remove container directory: %w", err)
-	}
-
 	stateDir := image.ContainerPath(id)
 	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
 	if err != nil {
@@ -86,6 +82,10 @@ func RemoveContainer(id string) error {
 	}
 
 	CleanupContainer(id, cc.PortMap)
+
+	if err := os.RemoveAll(containerPath); err != nil {
+		return fmt.Errorf("failed to remove container directory: %w", err)
+	}
 
 	return nil
 }
