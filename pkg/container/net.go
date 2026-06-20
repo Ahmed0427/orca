@@ -70,13 +70,11 @@ func CreateContainer(cc ContainerConfig) {
 }
 
 func EnsureBridge() {
-	if err := exec.Command("ip", "link", "show", BridgeName).Run(); err == nil {
-		return
+	if err := exec.Command("ip", "link", "show", BridgeName).Run(); err != nil {
+		RunCmd("ip", "link", "add", "name", BridgeName, "type", "bridge")
+		RunCmd("ip", "addr", "add", BridgeIP, "dev", BridgeName)
+		RunCmd("ip", "link", "set", BridgeName, "up")
 	}
-
-	RunCmd("ip", "link", "add", "name", BridgeName, "type", "bridge")
-	RunCmd("ip", "addr", "add", BridgeIP, "dev", BridgeName)
-	RunCmd("ip", "link", "set", BridgeName, "up")
 
 	if err := os.WriteFile(IPForwardFile, []byte("1"), 0644); err != nil {
 		log.Printf("Warning: could not enable ip_forward: %v", err)
@@ -84,14 +82,16 @@ func EnsureBridge() {
 
 	_ = RunCmdSilent("sysctl", "-w", "net.ipv4.conf.all.route_localnet=1")
 	_ = RunCmdSilent("sysctl", "-w", "net.ipv4.conf."+BridgeName+".route_localnet=1")
+
 	_ = RunCmdSilent("iptables", "-t", "nat", "-N", "ORCA-DNAT")
 
-	AddRuleIfMissing("nat", "PREROUTING",
+	AddRuleIfMissing("nat", "OUTPUT",
 		"-m", "addrtype",
 		"--dst-type", "LOCAL",
 		"-j", "ORCA-DNAT",
 	)
-	AddRuleIfMissing("nat", "OUTPUT",
+
+	AddRuleIfMissing("nat", "PREROUTING",
 		"-m", "addrtype",
 		"--dst-type", "LOCAL",
 		"-j", "ORCA-DNAT",
@@ -139,7 +139,7 @@ func SetupPortMapping(containerIP, portMap string) {
 
 	RunCmd("iptables",
 		"-t", "nat",
-		"-A", portChain,
+		"-I", portChain, "1",
 		"-p", "tcp",
 		"-j", "DNAT",
 		"--to-destination", target,
@@ -151,7 +151,7 @@ func AddRuleIfMissing(table, chain string, rule ...string) {
 	if err := RunCmdSilent("iptables", args...); err == nil {
 		return
 	}
-	args = append([]string{"-t", table, "-A", chain}, rule...)
+	args = append([]string{"-t", table, "-I", chain, "1"}, rule...)
 	RunCmd("iptables", args...)
 }
 
@@ -164,11 +164,32 @@ func AllocateIP() string {
 	return fmt.Sprintf("10.200.0.%d/16", lastOctet)
 }
 
-func CleanupContainer(id string) {
+func CleanupContainer(id string, portMap string) {
 	name := id[len(id)-8:]
 	vethHost := fmt.Sprintf("veth-%s", name)
 	_ = RunCmdSilent("ip", "link", "del", vethHost)
 	_ = RunCmdSilent("ip", "netns", "del", name)
+
+	if portMap != "" {
+		ports := strings.Split(portMap, ":")
+		if len(ports) != 2 {
+			panic("port mapping must provide two ports in form 'hostPort:ContainerPort'")
+		}
+		hostPort := ports[0]
+
+		// remove the link from the main chain first
+		portChain := fmt.Sprintf("ORCA-P-%s", hostPort)
+		_ = RunCmdSilent("iptables",
+			"-t", "nat",
+			"-D", "ORCA-DNAT",
+			"-p", "tcp",
+			"--dport", hostPort,
+			"-j", portChain,
+		)
+		// flush and delete the custom port chain
+		_ = RunCmdSilent("iptables", "-t", "nat", "-F", portChain)
+		_ = RunCmdSilent("iptables", "-t", "nat", "-X", portChain)
+	}
 }
 
 func CleanupNet() {

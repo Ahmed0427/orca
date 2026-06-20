@@ -1,6 +1,7 @@
 package container
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -74,7 +75,17 @@ func RemoveContainer(id string) error {
 		return fmt.Errorf("failed to remove container directory: %w", err)
 	}
 
-	CleanupContainer(id)
+	stateDir := image.ContainerPath(id)
+	configBytes, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+	var cc ContainerConfig
+	if err := json.Unmarshal(configBytes, &cc); err != nil {
+		return err
+	}
+
+	CleanupContainer(id, cc.PortMap)
 
 	return nil
 }

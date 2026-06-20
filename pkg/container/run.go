@@ -214,7 +214,7 @@ func StartWithPTY(exeCmd *exec.Cmd, id string, cc ContainerConfig) error {
 			exitCode = 1
 		}
 	}
-	CleanupContainer(id)
+	CleanupContainer(id, cc.PortMap)
 	stateDir := image.ContainerPath(id)
 	return os.WriteFile(filepath.Join(stateDir, "exit-code"),
 		[]byte(strconv.Itoa(exitCode)), 0644)
@@ -256,7 +256,7 @@ func StartWithoutPTY(exeCmd *exec.Cmd, id string, cc ContainerConfig, interactiv
 			exitCode = 1
 		}
 	}
-	CleanupContainer(id)
+	CleanupContainer(id, cc.PortMap)
 	stateDir := image.ContainerPath(id)
 	return os.WriteFile(filepath.Join(stateDir, "exit-code"),
 		[]byte(strconv.Itoa(exitCode)), 0644)
@@ -330,7 +330,7 @@ func RunShim(id string) error {
 		}
 	}
 
-	CleanupContainer(id)
+	CleanupContainer(id, cc.PortMap)
 	return os.WriteFile(filepath.Join(stateDir, "exit-code"),
 		[]byte(strconv.Itoa(exitCode)), 0644)
 }
