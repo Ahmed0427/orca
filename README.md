@@ -1,48 +1,74 @@
 # Orca
 
-**Orca** is a lightweight, educational container runtime built in Go.
-It aims to demonstrate how containers work under the hood by implementing core containerization features from scratch.
+A minimal container runtime written in Go.  
+Orca can pull OCI/Docker images from a registry, run containers with Linux namespaces, cgroups, and a custom bridge network, all without Docker or containerd.
 
-## Current State & Features
+## Features
 
-The project currently supports basic container operations by interacting with OCI-compliant registries (like Docker Hub)
-and using Linux-native features for isolation.
+- **Image management** - `pull`, `verify`, `images`, `rm` (remove image or container)
+- **Container lifecycle** - `run` (foreground or detached), `containers`, `rm`
+- **OverlayFS** - efficient layered root filesystem
+- **Networking** - bridge network (`orca0`) with automatic IP allocation and port mapping
+- **Resource limits** - CPU, memory, and PID limits via cgroups v2
+- **Garbage collection** - removes unused image layers and blobs
 
-### Image Management
+## Requirements
 
-- **Pulling Images**: Download manifests, configurations, and layers directly from container registries.
-- **Layer Extraction**: Unpacks compressed layers into a local store.
-- **Storage Management**:
-  - `images`: List locally available image tags.
-  - `verify`: Check the structural integrity and hash consistency of downloaded images.
-  - `rm`: Remove specific image tags.
-  - `gc`: Garbage collection to prune unused layers and blobs.
+- Linux
+- iproute2
+- iptables
+- Root privileges
+- Go to build from source
 
-### Container Runtime
+## Build
 
-- **Process Isolation**: Uses Linux **Namespaces** (UTS, PID, NS, NET) to isolate the containerized process.
-- **Root Filesystem**: Implements **Chroot** to change the root directory for the container process.
-- **Layered Filesystem**: Uses **OverlayFS** to combine multiple image layers into a single, unified, and writable root filesystem for each container.
-- **Resource Limits**: Initial support for **Cgroups (v2)** to manage memory, CPU, and PID limits.
-- **Hostname Control**: Automatically sets the container hostname to a unique ID.
+```bash
+git clone https://github.com/ahmed0427/orca.git
+cd orca
+make # go build
+```
 
-## Project Structure
+## Usage
 
-- `cmd/orca/`: The main entry point and CLI command definitions.
-- `pkg/image/`: Logic for interacting with registries, managing the local image store, and layer extraction.
-- `pkg/container/`: Core runtime logic including namespace setup, cgroups, and mounting filesystems.
-- `pkg/progress/`: Utilities for rendering download and extraction progress bars.
+All commands require root. Run `orca` without arguments to see help.
 
-## Roadmap / Planned Work
+```bash
+sudo ./orca pull alpine
+sudo ./orca run alpine echo "Hello from container"
 
-- [ ] Improved Cgroup v2 resource limit configuration.
-- [ ] Network interface setup (veth pairs/bridge) for container connectivity.
-- [ ] Support for interactive terminal sessions (`-it`).
-- [ ] Volume mounting support.
-- [ ] Better handling of OCI image specifications.
+sudo ./orca pull busybox:musl
+sudo ./orca run -d -p 8080:8000 busybox:musl httpd -f -p 8000 -h .
 
-## Prerequisites
+sudo ./orca images
+sudo ./orca containers
+sudo ./orca rm <container-id>
+sudo ./orca gc # remove unused blobs and layers
+```
 
-- Linux (required for Namespaces, Cgroups, and OverlayFS).
-- Root privileges (required for mounting and namespace operations).
-- Go 1.21+ (for building).
+### Run options
+
+| Flag         | Description                          |
+| ------------ | ------------------------------------ |
+| `-i`         | Keep stdin open (default true)       |
+| `-t`         | Allocate a pseudo-TTY (default true) |
+| `-d`         | Run container in background          |
+| `-p`         | Port mapping (`host:container`)      |
+| `--name`     | Assign a name to the container       |
+| `--hostname` | Container host name                  |
+| `--memory`   | Memory limit (e.g. `256m`)           |
+| `--cpu`      | CPU limit (e.g. `1.5`)               |
+| `--pids`     | Max number of processes              |
+
+## Storage
+
+All data is stored under `/var/orca`:
+
+- `/var/orca/blobs` - compressed image layers and config blobs
+- `/var/orca/layers` - extracted layer directories
+- `/var/orca/tags` - image tag manifests
+- `/var/orca/containers` - container state and overlay mounts
+
+## Networking
+
+Orca creates a bridge `orca0` (`10.200.0.0/16`) and places each container in its own network namespace with a veth pair. Port mapping uses iptables DNAT rules.
+To tear down the bridge and all iptables rules, remove all containers with `orca rm all`.
