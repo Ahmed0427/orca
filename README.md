@@ -1,7 +1,7 @@
 # Orca
 
 A container runtime written in Go.  
-Orca can pull OCI/Docker images from a registry, run containers with Linux namespaces, cgroups, and a custom bridge network, all without Docker or containerd.
+Orca can pull OCI/Docker images from a registry, run containers with Linux namespaces, cgroups, and a custom bridge network, all without dockerd or containerd.
 
 ## Features
 
